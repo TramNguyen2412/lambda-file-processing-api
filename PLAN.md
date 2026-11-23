@@ -60,13 +60,33 @@ Function URLs (experiment riêng):
 
 ## Trạng thái tiến độ dự án
 
-- [x] **Phase 0 – Setup môi trường:** Node.js 24, npm, TypeScript, @types/aws-lambda.
-- [x] **Phase 1 – Phát triển mã nguồn:** 5 Handlers (`health`, `info`, `uploadExcel`, `generateExcel`, `generateExcelStream`), utils (`excelGenerator`, `excelParser`, `multipartParser`).
-- [x] **Phase 2 – Local Verification:** TypeScript type check (0 errors), Build compile (`dist/`), Local test suite (`test:local`) pass 100%.
-- [x] **Phase 3 – Đóng gói Lambda:** Đã tạo 5 gói `.zip` (11 MB/gói) trong `zips/`, tương thích Node.js 24.
-- [x] **Phase 4 – Chuẩn bị Test Payloads & Datasets:** Đã tổ chức vào `test-files/generated/` và `test-files/datasets/`.
-- [ ] **Phase 5 – AWS Deployment:** Chờ chạy theo thứ tự: `01-iam.sh` -> `02-lambda.sh` -> `03-apigateway.sh` -> `04-function-url.sh`.
-- [ ] **Phase 6 – AWS Experiments & Verification:** Chạy `05-test.sh` kiểm thử payload limits, response stream, memory và timeout.
+- [x] **Phase 0 - Setup môi trường:** Node.js 24, npm, TypeScript, @types/aws-lambda.
+- [x] **Phase 1 - Phát triển mã nguồn:** 5 Handlers (`health`, `info`, `uploadExcel`, `generateExcel`, `generateExcelStream`), utils (`excelGenerator`, `excelParser`, `multipartParser`).
+- [x] **Phase 2 - Local Verification:** TypeScript type check (0 errors), Build compile (`dist/`), Local test suite (`test:local`) pass 100%.
+- [x] **Phase 3 - Đóng gói Lambda:** Đã tạo 5 gói `.zip` (11 MB/gói) trong `zips/`, tương thích Node.js 24.
+- [x] **Phase 4 - Chuẩn bị Test Payloads & Datasets:** Đã tổ chức vào `test-files/generated/` và `test-files/datasets/`. Sinh 100% file `.xlsx` chuẩn bằng ExcelJS cho Mode A (Row benchmark) và Mode B (Target sizes 1MB-12MB).
+- [x] **Phase 5 - AWS Deployment (Hoàn thành):** Đã deploy trên Account 963348789774 (ap-southeast-2):
+  - IAM Role: `arn:aws:iam::963348789774:role/lambda-file-api-execution-role`
+  - 5 Lambda Functions: `health`, `info`, `upload-excel`, `generate-excel`, `generate-excel-stream`
+  - API Gateway HTTP API ID: `re09mfu3ui` (`https://re09mfu3ui.execute-api.ap-southeast-2.amazonaws.com/dev`)
+  - Function URLs: BUFFERED (`axopd52kkdmj3jjcmhcvqlhbny0tcjzs`) và RESPONSE_STREAM (`cojulflut4jrvrgplclci3yok40hjcgq`)
+- [/] **Phase 6 - AWS Testing & Experiments (Đang thực hiện):**
+  - **Completed & Passed:**
+    - [CORE-1] Health Check: PASS (HTTP 200, status "ok", Node.js v24.22.3)
+    - [CORE-2] Info & Limits: PASS (HTTP 200, AWS limits returned)
+    - [CORE-3A] Upload Small Excel Raw Binary (100 rows): PASS (HTTP 200, 100 rows parsed)
+    - [CORE-3B] Upload Small Excel Multipart (100 rows): PASS (HTTP 200, 100 rows parsed)
+    - [CORE-4] Upload Medium Excel (1,000 rows): PASS (HTTP 200, 1,000 rows parsed)
+    - [CORE-6] Generate Small Excel (1,000 rows): PASS (HTTP 200, file downloaded)
+    - [CORE-7] Generate Large Excel (50,000 rows, ~2.5 MB): PASS (HTTP 200, file downloaded)
+    - [EXP-1] Function URL BUFFERED (50,000 rows): PASS (HTTP 200)
+  - **Issues Identified in Initial Run & Fixes Applied:**
+    - [CORE-5] Boundary Upload: Initial run used arbitrary `.bin` files causing HTTP 422 ("not a valid Excel file"). Fix: Replaced all arbitrary `.bin` files with valid programmatic `.xlsx` workbooks (`excel-1mb.xlsx`, `excel-3mb.xlsx`, `excel-5mb.xlsx`, `excel-12mb.xlsx`) created with high-entropy cell contents, plus `invalid-corrupted.xlsx` for dedicated HTTP 422 validation testing.
+    - [EXP-2A / EXP-2B] Response Stream: Returned HTTP 200 but downloaded only 569 bytes. Cause: `generateExcelStream.ts` emitted `require("aws-lambda")`, which threw `Runtime.ImportModuleError`. In RESPONSE_STREAM mode, Lambda returns HTTP 200 and streams the error JSON (~569 bytes). Fix: Changed to `/// <reference types="aws-lambda" />`, added try/catch error streaming, recompiled and repackaged `zips/lambda-file-api-generate-excel-stream.zip`. Updated `05-test.sh` to check valid ZIP magic bytes, match actual vs expected byte count, and flag 569-byte responses as failures.
+  - **Remaining Work:**
+    - User executes Lambda code update: `aws lambda update-function-code --function-name lambda-file-api-generate-excel-stream --zip-file fileb://zips/lambda-file-api-generate-excel-stream.zip`
+    - User runs updated `bash infra/05-test.sh` to execute the revised test suite.
+    - Run EXP-3 (Memory Benchmark: 128MB vs 512MB vs 1024MB) and EXP-4 (Timeout Benchmark).
 
 ---
 
@@ -1112,34 +1132,51 @@ curl -s -X POST "$API_URL/upload-excel" \
 
 ---
 
-### CORE-5: Xác định giới hạn upload thực tế
+### CORE-5: Xac dinh gioi han upload thuc te (Valid .xlsx Workbooks)
 
-> **Mục đích:** Tìm ngưỡng thực tế, không giả định trước.
-> Base64 encode tăng kích thước ~33%, nên file ~4.5 MB → event JSON ~6 MB → sát limit Lambda.
+> **Muc dich:** Do luong nguong gioi han thuc te bang cac file Excel hop le (.xlsx), phan biet ro:
+> - Thanh cong: HTTP 200 + parse JSON hop le
+> - Rejection tai Lambda sync boundary (Base64 event > 6 MB): HTTP 413 hoac 500/502
+> - Rejection tai API Gateway edge (payload > 10 MB): HTTP 413
+> - Validation rejection (file hong hoac khong phai ZIP): HTTP 422
 
 ```bash
-# Test với 10,000 rows (~1 MB, an toàn)
-curl -si -X POST "$API_URL/upload-excel" \
+# 5.1: excel-1mb.xlsx (~1.06 MB valid .xlsx) -> Baseline safe upload (< 4.5 MB raw limit)
+curl -s -X POST "$API_URL/upload-excel" \
   -H "Content-Type: application/octet-stream" \
-  --data-binary @test-files/large-10000rows.xlsx \
-  -w "\n--- HTTP %{http_code} | %{size_upload} bytes sent | %{time_total}s ---\n"
+  --data-binary @test-files/generated/excel-1mb.xlsx
+# Expect: HTTP 200, rowCount = 3250
 
-# Test với 50,000 rows (xem size thực tế sau khi tạo file)
-curl -si -X POST "$API_URL/upload-excel" \
+# 5.2: excel-3mb.xlsx (~3.10 MB valid .xlsx) -> Upper safe limit qua API GW (Base64 ~4.1 MB)
+curl -s -X POST "$API_URL/upload-excel" \
   -H "Content-Type: application/octet-stream" \
-  --data-binary @test-files/xlarge-50000rows.xlsx \
-  -w "\n--- HTTP %{http_code} | %{size_upload} bytes sent | %{time_total}s ---\n"
+  --data-binary @test-files/generated/excel-3mb.xlsx
+# Expect: HTTP 200, rowCount = 9550
+
+# 5.3: excel-5mb.xlsx (~5.11 MB valid .xlsx) -> Vuot Lambda 6 MB synchronous limit sau khi Base64 (~6.8 MB)
+curl -s -X POST "$API_URL/upload-excel" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @test-files/generated/excel-5mb.xlsx
+# Expect: HTTP 413 hoac 500/502 (AWS integration rejection)
+
+# 5.4: excel-12mb.xlsx (~12.18 MB valid .xlsx) -> Vuot API Gateway 10 MB edge limit
+curl -s -X POST "$API_URL/upload-excel" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @test-files/generated/excel-12mb.xlsx
+# Expect: HTTP 413 Request Entity Too Large tai edge
+
+# 5.5: Online Retail.xlsx (23 MB real-world dataset) -> Vuot API Gateway 10 MB edge limit
+curl -s -X POST "$API_URL/upload-excel" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @"test-files/datasets/online+retail/Online Retail.xlsx"
+# Expect: HTTP 413 Request Entity Too Large tai edge
+
+# 5.6: invalid-corrupted.xlsx (file van ban gia mao .xlsx) -> Validation testing
+curl -s -X POST "$API_URL/upload-excel" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @test-files/generated/invalid-corrupted.xlsx
+# Expect: HTTP 422 Unprocessable Entity (missing ZIP/PK header)
 ```
-
-> **Ghi nhận kết quả:**
-> - `HTTP 413` ngay lập tức (< 1s): API Gateway từ chối (request > 10 MB)
-> - `HTTP 500` hoặc `HTTP 413` sau vài giây: Lambda từ chối do event > 6 MB
-> - Kiểm tra CloudWatch để phân biệt: nếu Lambda không được invoke → lỗi ở API GW; nếu có log → lỗi trong Lambda
->
-> ```bash
-> # Kiểm tra CloudWatch sau test
-> aws logs tail "/aws/lambda/$FN_UPLOAD" --since 2m
-> ```
 
 ---
 
@@ -1198,14 +1235,26 @@ curl -s "${BUFFERED_URL}?rows=50000" \
 
 ### EXP-2: Function URL RESPONSE_STREAM
 
-```bash
-echo "--- Function URL RESPONSE_STREAM ---"
-curl -s "${STREAM_URL}?rows=50000" \
-  -o /tmp/funcurl-stream-50k.xlsx \
-  -w "HTTP %{http_code} | %{size_download} bytes | %{time_total}s\n"
+> **Muc dich:** Kiem thu RESPONSE_STREAM nới lỏng response payload quota lên 200 MB.
+>
+> **Luu y quan trong:**
+> - Trong mode RESPONSE_STREAM, AWS Lambda luon mo stream bang HTTP 200. Neu handler bi loi khoi tao (vi du: thieu module runtime) hoac nem ngoai le, runtime se dong stream va ghi JSON loi (~569 bytes) vao body.
+> - Do do, curl kiem tra phai xac thuc:
+>   1. Body khong phai la loi runtime JSON (`errorType`, `Runtime.ImportModuleError`).
+>   2. Header bat dau bang magic bytes ZIP hop le (`PK\x03\x04`).
+>   3. So luong byte tai ve khop voi kich thuoc mong doi (khong chap nhan 569 bytes).
+> - Tranh dung `curl -i -o file` vi `-i` se ghi ca HTTP headers vao dau file binary lam hong file. Dung `-s -D headers.txt -o file`.
 
-ls -lh /tmp/funcurl-stream-50k.xlsx
-# Expected: thành công ngay cả khi file > 6 MB vì RESPONSE_STREAM cho phép 200 MB response
+```bash
+# EXP-2A: Excel Mode (50,000 rows)
+curl -s -D /tmp/stream-headers.txt "${STREAM_URL}?rows=50000" \
+  -o /tmp/funcurl-stream-50k.xlsx
+# Xac thuc: kich thuoc > 1 MB, magic bytes PK\x03\x04
+
+# EXP-2B: Synthetic Chunked Streaming (1 MB, 5 MB, 10 MB, 25 MB, 50 MB)
+curl -s -D /tmp/stream-headers.txt "${STREAM_URL}?mode=synthetic&sizeMB=10&chunkKB=64&format=csv" \
+  -o /tmp/stream-10mb.csv
+# Xac thuc: kich thuoc chinh xac 10 * 1024 * 1024 = 10,485,760 bytes
 ```
 
 ---
