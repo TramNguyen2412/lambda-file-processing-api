@@ -7,7 +7,7 @@
 # 2. AWS Lambda Synchronous Invocation Boundary (Hard limit: 6 MB Base64 event payload)
 #    - Binary payloads uploaded through API Gateway v2 are Base64-encoded, expanding by ~33.3%.
 #    - Effective raw upload ceiling via API Gateway is ~4.5 MB.
-# 3. Application Handler Layer (Memory guard at 5 MB; XLSX structure validation)
+# 3. Application Handler Layer (Memory guard at 5 MB; XLSX structure validation; HTTP 422 for invalid content)
 # 4. Lambda Function URL Response Streaming (Up to 200 MB response payload)
 #
 # Prerequisites:
@@ -103,6 +103,57 @@ format_snippet() {
   tr -d '\n\r' < "$FILE" | head -c "$MAX_CHARS"
 }
 
+# Validates that a downloaded file is a genuine, uncorrupted OpenXML SpreadsheetML (.xlsx) archive
+validate_downloaded_xlsx() {
+  local FILE="$1"
+  local MIN_BYTES="${2:-10000}"
+  python3 -c "
+import sys, os, zipfile, xml.etree.ElementTree as ET
+
+path = '$FILE'
+min_bytes = int('$MIN_BYTES')
+
+if not os.path.exists(path):
+    print('ERROR: File does not exist')
+    sys.exit(1)
+
+size = os.path.getsize(path)
+if size < min_bytes:
+    print(f'ERROR: File size ({size} bytes) below minimum expected ({min_bytes} bytes)')
+    sys.exit(1)
+
+try:
+    with zipfile.ZipFile(path, 'r') as z:
+        # Check ZIP CRC integrity for all archive entries
+        bad = z.testzip()
+        if bad:
+            print(f'ERROR: Corrupt zip entry: {bad}')
+            sys.exit(1)
+
+        namelist = z.namelist()
+        # Verify required OpenXML spreadsheet structure
+        if '[Content_Types].xml' not in namelist or 'xl/workbook.xml' not in namelist:
+            print('ERROR: Missing required OpenXML SpreadsheetML structures ([Content_Types].xml / xl/workbook.xml)')
+            sys.exit(1)
+
+        sheets = [n for n in namelist if n.startswith('xl/worksheets/sheet') and n.endswith('.xml')]
+        if not sheets:
+            print('ERROR: No worksheet xml found in archive')
+            sys.exit(1)
+
+        # Open and parse the worksheet XML locally to verify readability
+        with z.open(sheets[0]) as sf:
+            tree = ET.parse(sf)
+            rows = len(tree.getroot().findall('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}row'))
+            data_rows = max(0, rows - 1)
+            print(f'VALID: {size} bytes, {data_rows} data rows parsed')
+            sys.exit(0)
+except Exception as e:
+    print(f'ERROR: {str(e)}')
+    sys.exit(1)
+" 2>/dev/null
+}
+
 # ------------------------------------------------------------------------------
 # Prerequisite: Explicit Required-File Generation Logic
 # ------------------------------------------------------------------------------
@@ -144,9 +195,9 @@ cat "$RESP_BODY"
 echo ""
 
 if [ "$HTTP_CODE" = "200" ] && python3 -c "import sys, json; data=json.load(open('$RESP_BODY')); sys.exit(0 if data.get('status')=='ok' else 1)" 2>/dev/null; then
-  record_pass "Health check returned HTTP 200 with status='ok'"
+  record_pass "CORE-1: Health check returned HTTP 200 with status='ok'"
 else
-  record_fail "Health check failed (HTTP $HTTP_CODE, body: $(format_snippet "$RESP_BODY"))"
+  record_fail "CORE-1: Health check failed (HTTP $HTTP_CODE, body: $(format_snippet "$RESP_BODY"))"
 fi
 echo ""
 
@@ -162,9 +213,9 @@ cat "$RESP_BODY"
 echo ""
 
 if [ "$HTTP_CODE" = "200" ] && python3 -c "import sys, json; data=json.load(open('$RESP_BODY')); sys.exit(0 if 'awsDocumentedLimits' in data else 1)" 2>/dev/null; then
-  record_pass "Info endpoint returned HTTP 200 with documented limit definitions"
+  record_pass "CORE-2: Info endpoint returned HTTP 200 with documented limit definitions"
 else
-  record_fail "Info endpoint failed (HTTP $HTTP_CODE, body: $(format_snippet "$RESP_BODY"))"
+  record_fail "CORE-2: Info endpoint failed (HTTP $HTTP_CODE, body: $(format_snippet "$RESP_BODY"))"
 fi
 echo ""
 
@@ -196,9 +247,9 @@ except Exception:
 " 2>/dev/null || echo "no")
 
 if [ "$HTTP_CODE" = "200" ] && [ "$VALID_PARSED" = "yes" ]; then
-  record_pass "Small Excel uploaded as raw binary and parsed successfully ($EXPECTED_ROWS rows)"
+  record_pass "CORE-3A: Small Excel uploaded as raw binary and parsed successfully ($EXPECTED_ROWS rows)"
 else
-  record_fail "Small Excel upload raw binary failed or parsed incorrectly (HTTP $HTTP_CODE, body: $(format_snippet "$RESP_BODY"))"
+  record_fail "CORE-3A: Small Excel upload raw binary failed or parsed incorrectly (HTTP $HTTP_CODE, body: $(format_snippet "$RESP_BODY"))"
 fi
 echo ""
 
@@ -229,9 +280,9 @@ except Exception:
 " 2>/dev/null || echo "no")
 
 if [ "$HTTP_CODE" = "200" ] && [ "$VALID_PARSED" = "yes" ]; then
-  record_pass "Small Excel uploaded as multipart form-data and parsed successfully ($EXPECTED_ROWS rows)"
+  record_pass "CORE-3B: Small Excel uploaded as multipart form-data and parsed successfully ($EXPECTED_ROWS rows)"
 else
-  record_fail "Small Excel upload multipart failed or parsed incorrectly (HTTP $HTTP_CODE, body: $(format_snippet "$RESP_BODY"))"
+  record_fail "CORE-3B: Small Excel upload multipart failed or parsed incorrectly (HTTP $HTTP_CODE, body: $(format_snippet "$RESP_BODY"))"
 fi
 echo ""
 
@@ -263,9 +314,9 @@ except Exception:
 " 2>/dev/null || echo "no")
 
 if [ "$HTTP_CODE" = "200" ] && [ "$VALID_PARSED" = "yes" ]; then
-  record_pass "Medium Excel uploaded and parsed successfully ($EXPECTED_ROWS rows)"
+  record_pass "CORE-4: Medium Excel uploaded and parsed successfully ($EXPECTED_ROWS rows)"
 else
-  record_fail "Medium Excel upload failed or parsed incorrectly (HTTP $HTTP_CODE, body: $(format_snippet "$RESP_BODY"))"
+  record_fail "CORE-4: Medium Excel upload failed or parsed incorrectly (HTTP $HTTP_CODE, body: $(format_snippet "$RESP_BODY"))"
 fi
 echo ""
 
@@ -302,9 +353,9 @@ except Exception:
 " 2>/dev/null || echo "no")
 
 if [ "$HTTP_CODE" = "200" ] && [ "$VALID_1MB_PARSED" = "yes" ]; then
-  record_pass "Test 5.1: excel-1mb.xlsx uploaded and parsed successfully ($EXPECTED_1MB_ROWS rows matched local file)"
+  record_pass "CORE-5.1: excel-1mb.xlsx uploaded and parsed successfully ($EXPECTED_1MB_ROWS rows matched local file)"
 else
-  record_fail "Test 5.1: excel-1mb.xlsx expected HTTP 200 with $EXPECTED_1MB_ROWS rows, got HTTP $HTTP_CODE (body: $(format_snippet "$RESP_BODY"))"
+  record_fail "CORE-5.1: excel-1mb.xlsx expected HTTP 200 with $EXPECTED_1MB_ROWS rows, got HTTP $HTTP_CODE (body: $(format_snippet "$RESP_BODY"))"
 fi
 echo ""
 
@@ -334,9 +385,9 @@ except Exception:
 " 2>/dev/null || echo "no")
 
 if [ "$HTTP_CODE" = "200" ] && [ "$VALID_3MB_PARSED" = "yes" ]; then
-  record_pass "Test 5.2: excel-3mb.xlsx uploaded and parsed successfully ($EXPECTED_3MB_ROWS rows matched local file)"
+  record_pass "CORE-5.2: excel-3mb.xlsx uploaded and parsed successfully ($EXPECTED_3MB_ROWS rows matched local file)"
 else
-  record_fail "Test 5.2: excel-3mb.xlsx expected HTTP 200 with $EXPECTED_3MB_ROWS rows, got HTTP $HTTP_CODE (body: $(format_snippet "$RESP_BODY"))"
+  record_fail "CORE-5.2: excel-3mb.xlsx expected HTTP 200 with $EXPECTED_3MB_ROWS rows, got HTTP $HTTP_CODE (body: $(format_snippet "$RESP_BODY"))"
 fi
 echo ""
 
@@ -356,35 +407,25 @@ echo ""
 
 BODY_SNIPPET=$(format_snippet "$RESP_BODY")
 
-# Strictly classify the rejection layer rather than accepting unverified errors
 if [ "$HTTP_CODE" = "413" ]; then
-  IS_HANDLER_GUARD=$(grep -c "maximum parse limit" "$RESP_BODY" 2>/dev/null || echo "0")
-  if [ "$IS_HANDLER_GUARD" -gt 0 ]; then
-    record_pass "Test 5.3: excel-5mb.xlsx rejected by Lambda application handler memory guard (HTTP 413: $BODY_SNIPPET)"
+  # Application-level memory guard in Lambda handler (MAX_PARSE_BYTES = 5 MB)
+  if grep -q "maximum parse limit" "$RESP_BODY" 2>/dev/null; then
+    record_pass "CORE-5.3: excel-5mb.xlsx verified application-level rejection by Lambda memory guard (HTTP 413: $BODY_SNIPPET)"
+  # AWS Edge / Service payload rejection
+  elif grep -qi "payload too large" "$RESP_BODY" 2>/dev/null || grep -qi "request entity too large" "$RESP_BODY" 2>/dev/null; then
+    record_pass "CORE-5.3: excel-5mb.xlsx verified AWS infrastructure payload limit rejection (HTTP 413: $BODY_SNIPPET)"
   else
-    record_pass "Test 5.3: excel-5mb.xlsx rejected by AWS synchronous invocation payload quota (HTTP 413: $BODY_SNIPPET)"
+    record_fail "CORE-5.3: INCONCLUSIVE / UNVERIFIED - Received HTTP 413 with unidentifiable response body: $BODY_SNIPPET. Cannot conclusively identify whether rejection was application-level or AWS infrastructure."
   fi
 elif [ "$HTTP_CODE" = "500" ] || [ "$HTTP_CODE" = "502" ]; then
-  # API Gateway HTTP API v2 returns 500 or 502 when the integration payload exceeds Lambda's 6 MB invocation quota
-  IS_INTEGRATION_REJECTION=$(python3 -c "
-import sys, json
-try:
-    data = json.load(open('$RESP_BODY'))
-    msg = data.get('message', '')
-    sys.exit(0 if ('Internal Server Error' in msg or 'Bad Gateway' in msg) else 1)
-except Exception:
-    sys.exit(1)
-" 2>/dev/null && echo "yes" || echo "no")
-
-  if [ "$IS_INTEGRATION_REJECTION" = "yes" ]; then
-    record_pass "Test 5.3: excel-5mb.xlsx rejected at API Gateway integration layer due to Lambda 6 MB Base64 event limit (HTTP $HTTP_CODE: $BODY_SNIPPET)"
-  else
-    record_fail "Test 5.3: excel-5mb.xlsx returned HTTP $HTTP_CODE with unrecognized response body: $BODY_SNIPPET"
-  fi
+  # In API Gateway HTTP API v2, exceeding the 6 MB event size at the Lambda integration boundary
+  # produces an HTTP 500 or 502 integration error. However, unhandled runtime crashes also produce
+  # HTTP 500/502. Without CloudWatch inspection, the rejection layer cannot be conclusively identified.
+  record_fail "CORE-5.3: INCONCLUSIVE / UNVERIFIED - Received HTTP $HTTP_CODE (body: $BODY_SNIPPET). Rejection layer cannot be conclusively identified as Lambda 6 MB payload boundary vs runtime crash without CloudWatch inspection ('aws logs tail /aws/lambda/\$FN_UPLOAD --since 2m')."
 elif [ "$HTTP_CODE" = "200" ]; then
-  record_fail "Test 5.3: excel-5mb.xlsx unexpectedly passed with HTTP 200. A 5.1 MB raw file in Base64 must exceed the 6 MB event limit!"
+  record_fail "CORE-5.3: excel-5mb.xlsx unexpectedly passed with HTTP 200. A 5.1 MB raw file in Base64 must exceed the 6 MB event limit!"
 else
-  record_fail "Test 5.3: excel-5mb.xlsx returned unexpected status HTTP $HTTP_CODE (body: $BODY_SNIPPET)"
+  record_fail "CORE-5.3: excel-5mb.xlsx returned unexpected status HTTP $HTTP_CODE (body: $BODY_SNIPPET)"
 fi
 echo ""
 
@@ -404,9 +445,9 @@ echo ""
 BODY_SNIPPET=$(format_snippet "$RESP_BODY")
 
 if [ "$HTTP_CODE" = "413" ]; then
-  record_pass "Test 5.4: excel-12mb.xlsx rejected at API Gateway Edge Proxy (> 10 MB edge limit) (HTTP 413: $BODY_SNIPPET)"
+  record_pass "CORE-5.4: excel-12mb.xlsx rejected at API Gateway Edge Proxy (> 10 MB edge limit) (HTTP 413: $BODY_SNIPPET)"
 else
-  record_fail "Test 5.4: excel-12mb.xlsx expected HTTP 413 at edge, got HTTP $HTTP_CODE (body: $BODY_SNIPPET)"
+  record_fail "CORE-5.4: excel-12mb.xlsx expected HTTP 413 at edge, got HTTP $HTTP_CODE (body: $BODY_SNIPPET)"
 fi
 echo ""
 
@@ -427,9 +468,9 @@ if [ -f "test-files/datasets/online+retail/Online Retail.xlsx" ]; then
   BODY_SNIPPET=$(format_snippet "$RESP_BODY")
 
   if [ "$HTTP_CODE" = "413" ]; then
-    record_pass "Test 5.5: Online Retail.xlsx (23 MB) rejected at API Gateway Edge Proxy with HTTP 413 ($BODY_SNIPPET)"
+    record_pass "CORE-5.5: Online Retail.xlsx (23 MB) rejected at API Gateway Edge Proxy with HTTP 413 ($BODY_SNIPPET)"
   else
-    record_fail "Test 5.5: Online Retail.xlsx expected HTTP 413 at edge, got HTTP $HTTP_CODE (body: $BODY_SNIPPET)"
+    record_fail "CORE-5.5: Online Retail.xlsx expected HTTP 413 at edge, got HTTP $HTTP_CODE (body: $BODY_SNIPPET)"
   fi
   echo ""
 fi
@@ -454,9 +495,9 @@ data = json.load(open('$RESP_BODY'))
 assert data.get('success') is False
 assert 'error' in data
 " 2>/dev/null; then
-  record_pass "Test 5.6: invalid-corrupted.xlsx cleanly rejected with HTTP 422 by handler validation (body: $BODY_SNIPPET)"
+  record_pass "CORE-5.6: invalid-corrupted.xlsx cleanly rejected with HTTP 422 by handler validation (body: $BODY_SNIPPET)"
 else
-  record_fail "Test 5.6: invalid-corrupted.xlsx expected HTTP 422 with error JSON, got HTTP $HTTP_CODE (body: $BODY_SNIPPET)"
+  record_fail "CORE-5.6: invalid-corrupted.xlsx expected HTTP 422 with error JSON, got HTTP $HTTP_CODE (body: $BODY_SNIPPET)"
 fi
 echo ""
 
@@ -474,22 +515,13 @@ HTTP_CODE=$(curl -s -D "$RESP_HDRS" -o "$DOWNLOAD_FILE" -w "%{http_code}" \
 echo "HTTP Status: $HTTP_CODE"
 ls -lh "$DOWNLOAD_FILE" || true
 
-IS_VALID_ZIP=$(python3 -c "
-import sys
-try:
-    with open('$DOWNLOAD_FILE', 'rb') as f:
-        magic = f.read(4)
-    sys.exit(0 if magic == b'PK\x03\x04' else 1)
-except Exception:
-    sys.exit(1)
-" 2>/dev/null && echo "yes" || echo "no")
+VAL_OUTPUT=$(validate_downloaded_xlsx "$DOWNLOAD_FILE" 10000)
+VAL_CODE=$?
 
-FILE_SIZE=$(wc -c < "$DOWNLOAD_FILE" 2>/dev/null || echo "0")
-
-if [ "$HTTP_CODE" = "200" ] && [ "$IS_VALID_ZIP" = "yes" ] && [ "$FILE_SIZE" -gt 10000 ]; then
-  record_pass "Small Excel generated successfully via API Gateway (Size: $FILE_SIZE bytes, valid ZIP magic header)"
+if [ "$HTTP_CODE" = "200" ] && [ "$VAL_CODE" -eq 0 ]; then
+  record_pass "CORE-6: Small Excel generated and validated as genuine XLSX ($VAL_OUTPUT)"
 else
-  record_fail "Small Excel generation failed (HTTP $HTTP_CODE, Size: $FILE_SIZE bytes, Valid ZIP: $IS_VALID_ZIP)"
+  record_fail "CORE-6: Small Excel generation failed (HTTP $HTTP_CODE, validation: $VAL_OUTPUT)"
 fi
 echo ""
 
@@ -507,22 +539,13 @@ HTTP_CODE=$(curl -s -D "$RESP_HDRS" -o "$DOWNLOAD_FILE" -w "%{http_code}" \
 echo "HTTP Status: $HTTP_CODE"
 ls -lh "$DOWNLOAD_FILE" || true
 
-IS_VALID_ZIP=$(python3 -c "
-import sys
-try:
-    with open('$DOWNLOAD_FILE', 'rb') as f:
-        magic = f.read(4)
-    sys.exit(0 if magic == b'PK\x03\x04' else 1)
-except Exception:
-    sys.exit(1)
-" 2>/dev/null && echo "yes" || echo "no")
+VAL_OUTPUT=$(validate_downloaded_xlsx "$DOWNLOAD_FILE" 1000000)
+VAL_CODE=$?
 
-FILE_SIZE=$(wc -c < "$DOWNLOAD_FILE" 2>/dev/null || echo "0")
-
-if [ "$HTTP_CODE" = "200" ] && [ "$IS_VALID_ZIP" = "yes" ] && [ "$FILE_SIZE" -gt 1000000 ]; then
-  record_pass "Large Excel (50k rows) generated successfully via API Gateway (Size: $FILE_SIZE bytes, valid ZIP magic header)"
+if [ "$HTTP_CODE" = "200" ] && [ "$VAL_CODE" -eq 0 ]; then
+  record_pass "CORE-7: Large Excel (50k rows) generated and validated as genuine XLSX ($VAL_OUTPUT)"
 else
-  record_fail "Large Excel generation failed (HTTP $HTTP_CODE, Size: $FILE_SIZE bytes, Valid ZIP: $IS_VALID_ZIP)"
+  record_fail "CORE-7: Large Excel generation failed (HTTP $HTTP_CODE, validation: $VAL_OUTPUT)"
 fi
 echo ""
 
@@ -541,22 +564,13 @@ if [ -n "$BUFFERED_URL" ] && [ "$BUFFERED_URL" != "None" ]; then
   echo "HTTP Status: $HTTP_CODE"
   ls -lh "$DOWNLOAD_FILE" || true
 
-  IS_VALID_ZIP=$(python3 -c "
-import sys
-try:
-    with open('$DOWNLOAD_FILE', 'rb') as f:
-        magic = f.read(4)
-    sys.exit(0 if magic == b'PK\x03\x04' else 1)
-except Exception:
-    sys.exit(1)
-" 2>/dev/null && echo "yes" || echo "no")
+  VAL_OUTPUT=$(validate_downloaded_xlsx "$DOWNLOAD_FILE" 1000000)
+  VAL_CODE=$?
 
-  FILE_SIZE=$(wc -c < "$DOWNLOAD_FILE" 2>/dev/null || echo "0")
-
-  if [ "$HTTP_CODE" = "200" ] && [ "$IS_VALID_ZIP" = "yes" ] && [ "$FILE_SIZE" -gt 1000000 ]; then
-    record_pass "EXP-1: Function URL BUFFERED generated 50k rows successfully (Size: $FILE_SIZE bytes, valid ZIP)"
+  if [ "$HTTP_CODE" = "200" ] && [ "$VAL_CODE" -eq 0 ]; then
+    record_pass "EXP-1: Function URL BUFFERED generated and validated as genuine XLSX ($VAL_OUTPUT)"
   else
-    record_fail "EXP-1: Function URL BUFFERED failed (HTTP $HTTP_CODE, Size: $FILE_SIZE bytes, Valid ZIP: $IS_VALID_ZIP)"
+    record_fail "EXP-1: Function URL BUFFERED failed (HTTP $HTTP_CODE, validation: $VAL_OUTPUT)"
   fi
   echo ""
 fi
@@ -578,36 +592,27 @@ if [ -n "$STREAM_URL" ] && [ "$STREAM_URL" != "None" ]; then
 
   FILE_SIZE=$(wc -c < "$DOWNLOAD_FILE" 2>/dev/null || echo "0")
 
-  # Detect Lambda runtime initialization error (typically ~569 bytes containing errorType or Runtime.ImportModuleError)
+  # Detect Lambda runtime initialization or import error JSON (e.g. Runtime.ImportModuleError)
   IS_RUNTIME_ERROR=$(python3 -c "
 import sys
 try:
     with open('$DOWNLOAD_FILE', 'rb') as f:
         content = f.read(2048).decode('utf-8', errors='ignore')
-    sys.exit(0 if ('errorType' in content or 'Runtime.ImportModuleError' in content) else 1)
+    sys.exit(0 if ('errorType' in content or 'Runtime.ImportModuleError' in content or 'errorMessage' in content) else 1)
 except Exception:
     sys.exit(1)
 " 2>/dev/null && echo "yes" || echo "no")
 
-  IS_VALID_ZIP=$(python3 -c "
-import sys
-try:
-    with open('$DOWNLOAD_FILE', 'rb') as f:
-        magic = f.read(4)
-    sys.exit(0 if magic == b'PK\x03\x04' else 1)
-except Exception:
-    sys.exit(1)
-" 2>/dev/null && echo "yes" || echo "no")
+  VAL_OUTPUT=$(validate_downloaded_xlsx "$DOWNLOAD_FILE" 1000000)
+  VAL_CODE=$?
 
   if [ "$IS_RUNTIME_ERROR" = "yes" ] || [ "$FILE_SIZE" -lt 1000 ]; then
-    record_fail "EXP-2A: Function URL returned Lambda runtime error body (Size: $FILE_SIZE bytes). Deployed Lambda requires zip update to eliminate 'aws-lambda' import error!"
-    echo "Diagnostic Body Preview:"
-    head -n 10 "$DOWNLOAD_FILE"
-    echo ""
-  elif [ "$HTTP_CODE" = "200" ] && [ "$IS_VALID_ZIP" = "yes" ] && [ "$FILE_SIZE" -gt 1000000 ]; then
-    record_pass "EXP-2A: Function URL RESPONSE_STREAM generated 50k rows successfully (Size: $FILE_SIZE bytes, valid ZIP)"
+    RECORD_SNIPPET=$(format_snippet "$DOWNLOAD_FILE" 200)
+    record_fail "EXP-2A: Function URL returned Lambda runtime error rather than response stream (HTTP $HTTP_CODE, Size: $FILE_SIZE bytes: $RECORD_SNIPPET). Deployed Lambda requires zip update to eliminate 'aws-lambda' import error!"
+  elif [ "$HTTP_CODE" = "200" ] && [ "$VAL_CODE" -eq 0 ]; then
+    record_pass "EXP-2A: Function URL RESPONSE_STREAM generated and validated as genuine XLSX ($VAL_OUTPUT)"
   else
-    record_fail "EXP-2A: Function URL RESPONSE_STREAM failed (HTTP $HTTP_CODE, Size: $FILE_SIZE bytes, Valid ZIP: $IS_VALID_ZIP)"
+    record_fail "EXP-2A: Function URL RESPONSE_STREAM failed (HTTP $HTTP_CODE, Size: $FILE_SIZE bytes, validation: $VAL_OUTPUT)"
   fi
   echo ""
 
@@ -637,7 +642,7 @@ import sys
 try:
     with open('$STREAM_FILE', 'rb') as f:
         content = f.read(2048).decode('utf-8', errors='ignore')
-    sys.exit(0 if ('errorType' in content or 'Runtime.ImportModuleError' in content) else 1)
+    sys.exit(0 if ('errorType' in content or 'Runtime.ImportModuleError' in content or 'errorMessage' in content) else 1)
 except Exception:
     sys.exit(1)
 " 2>/dev/null && echo "yes" || echo "no")
@@ -646,15 +651,15 @@ except Exception:
     echo "Downloaded Bytes  : $ACTUAL_BYTES (Expected: $EXPECTED_BYTES bytes)"
     echo "Elapsed Time      : ${ELAPSED_MS} ms"
 
+    STREAM_SNIPPET=$(format_snippet "$STREAM_FILE" 200)
+
     if [ "$IS_RUNTIME_ERR" = "yes" ] || [ "$ACTUAL_BYTES" -lt 1000 ]; then
-      record_fail "EXP-2B (${SIZE_MB} MB): Function URL returned runtime error instead of stream (Size: $ACTUAL_BYTES bytes). Needs zip update on AWS!"
-      head -n 5 "$STREAM_FILE"
-      echo ""
+      record_fail "EXP-2B (${SIZE_MB} MB): Function URL returned runtime error instead of stream (HTTP $HTTP_CODE, Size: $ACTUAL_BYTES bytes: $STREAM_SNIPPET). Needs zip update on AWS!"
     elif [ "$HTTP_CODE" = "200" ] && [ "$ACTUAL_BYTES" -eq "$EXPECTED_BYTES" ]; then
       THROUGHPUT_MB_S=$(python3 -c "print(round(($ACTUAL_BYTES / 1024 / 1024) / ($ELAPSED_MS / 1000), 2))" 2>/dev/null || echo "N/A")
-      record_pass "EXP-2B (${SIZE_MB} MB): Exact size match ($ACTUAL_BYTES bytes streamed, Throughput: ${THROUGHPUT_MB_S} MB/s)"
+      record_pass "EXP-2B (${SIZE_MB} MB): Exact size match ($ACTUAL_BYTES bytes streamed, Throughput: ${THROUGHPUT_MB_S} MB/s in ${ELAPSED_MS}ms)"
     else
-      record_fail "EXP-2B (${SIZE_MB} MB): Size mismatch or HTTP error (Got $ACTUAL_BYTES bytes, Expected $EXPECTED_BYTES bytes, HTTP $HTTP_CODE)"
+      record_fail "EXP-2B (${SIZE_MB} MB): Stream failed (HTTP $HTTP_CODE, Downloaded: $ACTUAL_BYTES / Expected: $EXPECTED_BYTES bytes, details: $STREAM_SNIPPET)"
     fi
     echo ""
   done
