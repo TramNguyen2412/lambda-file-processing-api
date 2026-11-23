@@ -1,8 +1,29 @@
+# Dependencies
 node_modules/
 dist/
+
+# Build artifacts
+zips/
+
+# Environment & secrets
 .env
 .env.*
 !.env.example
+
+# Test files (can be regenerated)
+test-files/
+
+# Logs
 *.log
-coverage/
+npm-debug.log*
+
+# OS
 .DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Coverage
+coverage/

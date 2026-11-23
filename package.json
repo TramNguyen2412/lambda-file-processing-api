@@ -1,0 +1,21 @@
+{
+  "name": "lambda-file-processing-api",
+  "version": "1.0.0",
+  "description": "AWS Lambda file processing API – learning project",
+  "private": true,
+  "scripts": {
+    "build:check": "tsc --noEmit",
+    "build": "tsc",
+    "package": "bash scripts/package.sh",
+    "gen:test-files": "bash scripts/generate-test-files.sh",
+    "test:local": "node scripts/test-local.mjs"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.145",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0"
+  }
+}

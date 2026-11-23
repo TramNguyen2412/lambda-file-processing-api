@@ -10,12 +10,12 @@
 
 | Layer | Request payload | Response payload | Ghi chú |
 |---|---|---|---|
-| API Gateway HTTP API | **10 MB** | **10 MB** | Hard limit, không tăng được, trả 413 nếu vượt |
+| API Gateway HTTP API | **10 MB** | **10 MB** | Hard limit edge, trả 413 nếu vượt. Timeout integration max 29s. |
 | Lambda – Synchronous (buffered) | **6 MB** | **6 MB** | Áp dụng cho invocation từ API GW và Function URL BUFFERED |
-| Lambda Function URL – BUFFERED | **6 MB** | **6 MB** | Giống Lambda sync, không khác API GW về payload |
-| Lambda Function URL – RESPONSE_STREAM | **6 MB** | **200 MB** | Chỉ nới response; request vẫn 6 MB |
-| Lambda – Max timeout | — | — | 15 phút; default khi tạo là 3 giây |
-| Lambda – Max memory | — | — | 10,240 MB; default 128 MB |
+| Lambda Function URL – BUFFERED | **6 MB** | **6 MB** | Giống Lambda sync, không khác API GW về payload. Timeout tới 15 phút. |
+| Lambda Function URL – RESPONSE_STREAM | **6 MB** | **200 MB** | Nới response lên 200 MB (6MB đầu unthrottled, sau đó 2 MB/s). Request vẫn 6 MB. |
+| Lambda – Max timeout | — | — | 15 phút (900s); default khi tạo là 3 giây. (Lưu ý API GW timeout hard limit là 29s). |
+| Lambda – Max memory | — | — | 10,240 MB; default 128 MB. 1 vCPU per 1,769 MB. |
 
 > **Những điều quan trọng cần hiểu rõ:**
 >
@@ -58,6 +58,18 @@ Function URLs (experiment riêng):
 
 ---
 
+## Trạng thái tiến độ dự án
+
+- [x] **Phase 0 – Setup môi trường:** Node.js 24, npm, TypeScript, @types/aws-lambda.
+- [x] **Phase 1 – Phát triển mã nguồn:** 5 Handlers (`health`, `info`, `uploadExcel`, `generateExcel`, `generateExcelStream`), utils (`excelGenerator`, `excelParser`, `multipartParser`).
+- [x] **Phase 2 – Local Verification:** TypeScript type check (0 errors), Build compile (`dist/`), Local test suite (`test:local`) pass 100%.
+- [x] **Phase 3 – Đóng gói Lambda:** Đã tạo 5 gói `.zip` (11 MB/gói) trong `zips/`, tương thích Node.js 24.
+- [x] **Phase 4 – Chuẩn bị Test Payloads & Datasets:** Đã tổ chức vào `test-files/generated/` và `test-files/datasets/`.
+- [ ] **Phase 5 – AWS Deployment:** Chờ chạy theo thứ tự: `01-iam.sh` -> `02-lambda.sh` -> `03-apigateway.sh` -> `04-function-url.sh`.
+- [ ] **Phase 6 – AWS Experiments & Verification:** Chạy `05-test.sh` kiểm thử payload limits, response stream, memory và timeout.
+
+---
+
 ## Cấu trúc thư mục
 
 ```
@@ -67,24 +79,34 @@ lambda-file-processing-api/
 ├── tsconfig.json
 ├── src/
 │   ├── handlers/
-│   │   ├── health.ts              ← GET /health
-│   │   ├── info.ts                ← GET /info
-│   │   ├── uploadExcel.ts         ← POST /upload-excel
-│   │   ├── generateExcel.ts       ← GET /generate-excel (buffered, API GW + Function URL)
-│   │   └── generateExcelStream.ts ← Function URL RESPONSE_STREAM only
+│   │   ├── health.ts              ← GET /health (metadata, memory)
+│   │   ├── info.ts                ← GET /info (AWS quotas, boundaries)
+│   │   ├── uploadExcel.ts         ← POST /upload-excel (raw binary & multipart support)
+│   │   ├── generateExcel.ts       ← GET /generate-excel (buffered, delay testing)
+│   │   └── generateExcelStream.ts ← Function URL RESPONSE_STREAM (excel + synthetic chunked)
 │   └── utils/
-│       ├── excelGenerator.ts      ← tạo Excel bằng exceljs, trả Buffer
-│       └── excelParser.ts         ← parse Excel từ Buffer
+│       ├── excelGenerator.ts      ← Tạo Excel Buffer
+│       ├── excelParser.ts         ← Parse Excel Buffer
+│       └── multipartParser.ts     ← Bóc tách file từ multipart/form-data
 ├── infra/
-│   ├── 00-variables.sh            ← biến dùng chung, source trước khi chạy script khác
-│   ├── 01-iam.sh                  ← tạo IAM execution role
-│   ├── 02-lambda.sh               ← build, package, deploy Lambda functions
-│   ├── 03-apigateway.sh           ← tạo API Gateway và routes
-│   ├── 04-function-url.sh         ← tạo Function URLs
-│   └── 99-cleanup.sh              ← xóa toàn bộ resource
+│   ├── 00-variables.sh            ← Biến môi trường
+│   ├── 01-iam.sh                  ← Tạo IAM Role
+│   ├── 02-lambda.sh               ← Deploy 5 Lambda functions
+│   ├── 03-apigateway.sh           ← Tạo HTTP API Gateway + 4 routes
+│   ├── 04-function-url.sh         ← Tạo 2 Function URLs
+│   ├── 05-test.sh                 ← Test suite đầy đủ các kịch bản
+│   └── 99-cleanup.sh              ← Xóa tài nguyên
 ├── scripts/
-│   └── generate-test-files.sh     ← tạo file Excel test với nhiều kích cỡ
-└── test-files/                    ← file Excel dùng để test upload (gitignore)
+│   ├── package.sh                 ← Đóng gói 5 zip files
+│   ├── test-local.mjs             ← Test local logic
+│   ├── generate-test-files.mjs    ← Sinh file test Mode A (Rows) & Mode B (Target sizes)
+│   └── generate-test-files.sh     ← Wrapper script
+└── test-files/                    ← (Được .gitignore bảo vệ 100%)
+    ├── generated/                 ← Payload đã sinh (1MB-15MB .bin & .xlsx)
+    └── datasets/                  ← Real-world datasets:
+        ├── online+retail/         ← Online Retail.xlsx (23 MB)
+        ├── onlineretail2/         ← online_retail_II.xlsx (44 MB)
+        └── olist/                 ← Olist ecommerce (9 files CSV: 2.6KB - 59MB)
 ```
 
 ---
@@ -104,7 +126,7 @@ aws sts get-caller-identity
 aws configure get region
 ```
 
-> ⚠️ Xác nhận `Account`, `Arn` và `region` khớp với môi trường muốn deploy. Không hardcode region nếu chưa chắc — lấy từ `aws configure get region` hoặc set `AWS_REGION` sau khi confirm.
+> Xác nhận `Account`, `Arn` và `region` khớp với môi trường muốn deploy. Không hardcode region nếu chưa chắc — lấy từ `aws configure get region` hoặc set `AWS_REGION` sau khi confirm.
 
 ### 0.2 `infra/00-variables.sh`
 
@@ -116,7 +138,7 @@ aws configure get region
 # Lấy region từ AWS config thay vì hardcode
 export AWS_REGION=$(aws configure get region)
 if [ -z "$AWS_REGION" ]; then
-  echo "❌ AWS region chưa được set. Chạy: aws configure set region <region>"
+  echo "AWS region chưa được set. Chạy: aws configure set region <region>"
   return 1
 fi
 
@@ -140,7 +162,7 @@ export API_NAME="${PROJECT}-http-api"
 export DIST_DIR="$(pwd)/dist"
 export ZIP_DIR="$(pwd)/zips"
 
-echo "✅ Variables loaded"
+echo "Variables loaded"
 echo "   Account : $AWS_ACCOUNT_ID"
 echo "   Region  : $AWS_REGION"
 echo "   Project : $PROJECT"
@@ -176,9 +198,9 @@ MANAGED_POLICY="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
 # Kiểm tra role đã tồn tại chưa
 if aws iam get-role --role-name "$LAMBDA_ROLE_NAME" 2>/dev/null | grep -q RoleName; then
-  echo "ℹ️  Role $LAMBDA_ROLE_NAME đã tồn tại, bỏ qua tạo mới."
+  echo " Role $LAMBDA_ROLE_NAME đã tồn tại, bỏ qua tạo mới."
 else
-  echo "🔐 Tạo IAM Role: $LAMBDA_ROLE_NAME"
+  echo "Tạo IAM Role: $LAMBDA_ROLE_NAME"
 
   cat > /tmp/trust-policy.json << 'EOF'
 {
@@ -196,26 +218,26 @@ EOF
   aws iam create-role \
     --role-name "$LAMBDA_ROLE_NAME" \
     --assume-role-policy-document file:///tmp/trust-policy.json \
-    --description "Execution role for $PROJECT – CloudWatch Logs only"
+    --description "Execution role for $PROJECT - CloudWatch Logs only"
 
   aws iam attach-role-policy \
     --role-name "$LAMBDA_ROLE_NAME" \
     --policy-arn "$MANAGED_POLICY"
 
-  echo "  ✅ Role created và policy attached"
-  echo "  ⏳ Đợi 10 giây để IAM propagate..."
+  echo "  Role created và policy attached"
+  echo "  Đợi 10 giây để IAM propagate..."
   sleep 10
 fi
 
 # Verify
 echo ""
-echo "📋 Role details:"
+echo "Role details:"
 aws iam get-role \
   --role-name "$LAMBDA_ROLE_NAME" \
   --query 'Role.{Arn:Arn, CreateDate:CreateDate}'
 
 echo ""
-echo "📋 Attached policies:"
+echo "Attached policies:"
 aws iam list-attached-role-policies \
   --role-name "$LAMBDA_ROLE_NAME" \
   --query 'AttachedPolicies[*].PolicyName'
@@ -594,7 +616,7 @@ export const handler = async (
 // Nếu invoke qua API Gateway hoặc Function URL BUFFERED → sẽ lỗi vì awslambda.streamifyResponse
 // không phải standard Lambda handler signature.
 //
-// ⚠️ Streaming ở đây là streaming HTTP response (toàn bộ buffer được write một lần vào stream),
+// Streaming ở đây là streaming HTTP response (toàn bộ buffer được write một lần vào stream),
 // KHÔNG phải streaming quá trình generate Excel.
 // ExcelJS vẫn tạo toàn bộ workbook trong memory trước (generateExcel trả Buffer),
 // sau đó buffer đó được write vào responseStream.
@@ -742,19 +764,19 @@ source infra/00-variables.sh
 PROJECT_ROOT="$(pwd)"
 mkdir -p "$ZIP_DIR"
 
-echo "🔨 TypeScript build check..."
+echo "TypeScript build check..."
 npm run build:check
 
-echo "🔨 TypeScript compile..."
+echo "TypeScript compile..."
 npx tsc
 
-echo "📦 Installing production dependencies..."
+echo "Installing production dependencies..."
 cp package.json "$DIST_DIR/"
 cd "$DIST_DIR"
 npm install --omit=dev --quiet
 cd "$PROJECT_ROOT"
 
-echo "🗜️  Packaging zips..."
+echo " Packaging zips..."
 # Zip toàn bộ dist (gồm cả node_modules của dist)
 # Project nhỏ → không cần tách riêng từng function
 for FN_NAME in "$FN_HEALTH" "$FN_INFO" "$FN_UPLOAD" "$FN_GENERATE" "$FN_GENERATE_STREAM"; do
@@ -763,10 +785,10 @@ for FN_NAME in "$FN_HEALTH" "$FN_INFO" "$FN_UPLOAD" "$FN_GENERATE" "$FN_GENERATE
   cd "$DIST_DIR"
   zip -r "$ZIP" . -x "*.ts" -x "package.json" > /dev/null
   cd "$PROJECT_ROOT"
-  echo "  ✅ $ZIP ($(du -sh "$ZIP" | cut -f1))"
+  echo "  $ZIP ($(du -sh "$ZIP" | cut -f1))"
 done
 
-echo "✅ Package complete"
+echo "Package complete"
 ```
 
 ---
@@ -790,11 +812,11 @@ deploy_fn() {
   local ZIP="$ZIP_DIR/${FN_NAME}.zip"
 
   if [ ! -f "$ZIP" ]; then
-    echo "❌ Zip không tồn tại: $ZIP. Chạy scripts/package.sh trước."
+    echo "Zip không tồn tại: $ZIP. Chạy scripts/package.sh trước."
     exit 1
   fi
 
-  echo "🚀 Deploying $FN_NAME (timeout=${TIMEOUT}s, memory=${MEMORY}MB)..."
+  echo "Deploying $FN_NAME (timeout=${TIMEOUT}s, memory=${MEMORY}MB)..."
 
   if aws lambda get-function --function-name "$FN_NAME" 2>/dev/null | grep -q '"FunctionName"'; then
     echo "  → Updating existing function..."
@@ -829,7 +851,7 @@ deploy_fn() {
     aws lambda wait function-active-v2 --function-name "$FN_NAME"
   fi
 
-  echo "  ✅ $FN_NAME ready"
+  echo "  $FN_NAME ready"
 }
 
 # Deploy theo thứ tự từ nhẹ đến nặng
@@ -840,11 +862,11 @@ deploy_fn "$FN_GENERATE"        "handlers/generateExcel.handler"       120  1024
 deploy_fn "$FN_GENERATE_STREAM" "handlers/generateExcelStream.handler" 120  1024
 
 echo ""
-echo "✅ All Lambda functions deployed"
+echo "All Lambda functions deployed"
 
 # Verify tất cả
 echo ""
-echo "📋 Function configurations:"
+echo "Function configurations:"
 for FN_NAME in "$FN_HEALTH" "$FN_INFO" "$FN_UPLOAD" "$FN_GENERATE" "$FN_GENERATE_STREAM"; do
   aws lambda get-function-configuration \
     --function-name "$FN_NAME" \
@@ -870,17 +892,17 @@ EXISTING_API_ID=$(aws apigatewayv2 get-apis \
   --output text 2>/dev/null)
 
 if [ "$EXISTING_API_ID" != "None" ] && [ -n "$EXISTING_API_ID" ]; then
-  echo "ℹ️  API $API_NAME đã tồn tại (ID: $EXISTING_API_ID)"
+  echo " API $API_NAME đã tồn tại (ID: $EXISTING_API_ID)"
   API_ID="$EXISTING_API_ID"
 else
-  echo "🌐 Tạo API Gateway HTTP API: $API_NAME"
+  echo "Tạo API Gateway HTTP API: $API_NAME"
   API_ID=$(aws apigatewayv2 create-api \
     --name "$API_NAME" \
     --protocol-type HTTP \
     --cors-configuration \
       AllowOrigins='*',AllowMethods='GET,POST,OPTIONS',AllowHeaders='Content-Type' \
     --query ApiId --output text)
-  echo "  ✅ API created: $API_ID"
+  echo "  API created: $API_ID"
 fi
 
 # Helper: tạo integration + route + lambda permission
@@ -914,7 +936,7 @@ add_route() {
     --source-arn "arn:aws:execute-api:${AWS_REGION}:${AWS_ACCOUNT_ID}:${API_ID}/*" \
     2>/dev/null || echo "    (permission $STMT_ID đã tồn tại)"
 
-  echo "  ✅ $METHOD $ROUTE_PATH → $FN_NAME"
+  echo "  $METHOD $ROUTE_PATH → $FN_NAME"
 }
 
 add_route "GET"  "/health"         "$FN_HEALTH"
@@ -927,11 +949,11 @@ aws apigatewayv2 create-stage \
   --api-id "$API_ID" \
   --stage-name "dev" \
   --auto-deploy > /dev/null 2>&1 || \
-  echo "ℹ️  Stage 'dev' đã tồn tại"
+  echo " Stage 'dev' đã tồn tại"
 
 API_URL="https://${API_ID}.execute-api.${AWS_REGION}.amazonaws.com/dev"
 echo ""
-echo "✅ API Gateway ready"
+echo "API Gateway ready"
 echo "   API_ID  = $API_ID"
 echo "   API_URL = $API_URL"
 ```
@@ -963,12 +985,12 @@ create_or_get_function_url() {
     --query FunctionUrl --output text 2>/dev/null || echo "")
 
   if [ -n "$EXISTING_URL" ] && [ "$EXISTING_URL" != "None" ]; then
-    echo "ℹ️  Function URL cho $FN_NAME đã tồn tại"
+    echo " Function URL cho $FN_NAME đã tồn tại"
     # Update invoke-mode nếu cần
     aws lambda update-function-url-config \
       --function-name "$FN_NAME" \
       --invoke-mode "$INVOKE_MODE" > /dev/null
-    echo "  ✅ InvokeMode updated: $INVOKE_MODE"
+    echo "  InvokeMode updated: $INVOKE_MODE"
     URL="$EXISTING_URL"
   else
     URL=$(aws lambda create-function-url-config \
@@ -977,7 +999,7 @@ create_or_get_function_url() {
       --invoke-mode "$INVOKE_MODE" \
       --cors AllowOrigins='*',AllowMethods='GET,POST',AllowHeaders='Content-Type' \
       --query FunctionUrl --output text)
-    echo "  ✅ Function URL created ($INVOKE_MODE)"
+    echo "  Function URL created ($INVOKE_MODE)"
   fi
 
   # Permission 1: lambda:InvokeFunction (cần thiết cho invocation)
@@ -1001,7 +1023,7 @@ create_or_get_function_url() {
   echo ""
 }
 
-echo "🔗 Setting up Lambda Function URLs..."
+echo "Setting up Lambda Function URLs..."
 echo ""
 
 echo "--- $FN_GENERATE (BUFFERED) ---"
@@ -1010,9 +1032,9 @@ create_or_get_function_url "$FN_GENERATE" "BUFFERED"
 echo "--- $FN_GENERATE_STREAM (RESPONSE_STREAM) ---"
 create_or_get_function_url "$FN_GENERATE_STREAM" "RESPONSE_STREAM"
 
-echo "✅ Function URLs ready"
+echo "Function URLs ready"
 echo ""
-echo "📋 Final URLs:"
+echo "Final URLs:"
 aws lambda get-function-url-config --function-name "$FN_GENERATE" --query FunctionUrl --output text
 aws lambda get-function-url-config --function-name "$FN_GENERATE_STREAM" --query FunctionUrl --output text
 ```
@@ -1325,28 +1347,28 @@ aws logs filter-log-events \
 #!/bin/bash
 source infra/00-variables.sh
 
-echo "🗑️  Cleanup bắt đầu..."
+echo " Cleanup bắt đầu..."
 
 # Xóa API Gateway
 API_ID=$(aws apigatewayv2 get-apis \
   --query "Items[?Name=='${API_NAME}'].ApiId | [0]" --output text 2>/dev/null)
 if [ "$API_ID" != "None" ] && [ -n "$API_ID" ]; then
   aws apigatewayv2 delete-api --api-id "$API_ID"
-  echo "  ✅ API Gateway deleted: $API_ID"
+  echo "  API Gateway deleted: $API_ID"
 fi
 
 # Xóa Function URLs
 for FN_NAME in "$FN_GENERATE" "$FN_GENERATE_STREAM"; do
   aws lambda delete-function-url-config \
     --function-name "$FN_NAME" 2>/dev/null && \
-    echo "  ✅ Function URL deleted: $FN_NAME" || true
+    echo "  Function URL deleted: $FN_NAME" || true
 done
 
 # Xóa Lambda functions
 for FN_NAME in "$FN_HEALTH" "$FN_INFO" "$FN_UPLOAD" "$FN_GENERATE" "$FN_GENERATE_STREAM"; do
   aws lambda delete-function --function-name "$FN_NAME" 2>/dev/null && \
-    echo "  ✅ Lambda deleted: $FN_NAME" || \
-    echo "  ℹ️  $FN_NAME không tồn tại (bỏ qua)"
+    echo "  Lambda deleted: $FN_NAME" || \
+    echo "   $FN_NAME không tồn tại (bỏ qua)"
 done
 
 # Xóa IAM (phải detach trước)
@@ -1356,11 +1378,11 @@ aws iam detach-role-policy \
   2>/dev/null || true
 aws iam delete-role \
   --role-name "$LAMBDA_ROLE_NAME" 2>/dev/null && \
-  echo "  ✅ IAM Role deleted" || \
-  echo "  ℹ️  IAM Role không tồn tại (bỏ qua)"
+  echo "  IAM Role deleted" || \
+  echo "   IAM Role không tồn tại (bỏ qua)"
 
 echo ""
-echo "✅ Cleanup complete"
+echo "Cleanup complete"
 ```
 
 ---
