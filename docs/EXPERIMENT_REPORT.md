@@ -1,8 +1,8 @@
-# Báo cáo Thực nghiệm: Triển khai và Khảo sát Giới hạn Kiến trúc trên AWS Serverless
+# Báo cáo Thực nghiệm: Tìm hiểu và Đo đạc Giới hạn AWS Serverless khi Xử lý File Excel
 
-> **Dự án:** AWS Lambda File Processing API  
+> **Mini-project:** AWS Lambda File Processing API  
 > **Môi trường thực thi:** Node.js 24.x (`nodejs24.x`), TypeScript, AWS Lambda, API Gateway HTTP API, Lambda Function URLs  
-> **Phạm vi báo cáo:** Toàn bộ quá trình triển khai hạ tầng, kiểm thử ranh giới và đo lường hiệu năng chuyên sâu từ Giai đoạn 01 đến Giai đoạn 06 (`infra/01-iam.sh` → `infra/06-benchmark.sh`)  
+> **Phạm vi báo cáo:** Toàn bộ quá trình dựng hạ tầng, kiểm thử ranh giới và đo hiệu năng từ Giai đoạn 01 đến Giai đoạn 06 (`infra/01-iam.sh` → `infra/06-benchmark.sh`)  
 > **Trạng thái thực nghiệm:** 21/21 kịch bản kiểm thử đạt chuẩn (PASS) ở Giai đoạn 05 và hoàn thành các phép đo hiệu năng Giai đoạn 06 (TEST A, B, C, D)  
 
 > **Quy ước đơn vị & ký hiệu số trong báo cáo:**  
@@ -402,9 +402,9 @@ Tất cả các gói kiểm thử đều tách riêng hoàn toàn HTTP Headers (
 
 ---
 
-## 5. Tổng kết Toàn diện Kết quả Dự án
+## 5. Tổng kết Kết quả Thực nghiệm
 
-Qua 6 giai đoạn thực hiện liên hoàn từ thiết lập hạ tầng đến đo lường hiệu năng chuyên sâu, dự án đã xác lập các kết luận thực nghiệm dựa trên bằng chứng đo đạc thực tế:
+Qua 6 giai đoạn thực hiện từ dựng hạ tầng đến đo hiệu năng, mini-project ghi nhận các kết quả thực tế sau:
 
 1. **Hạ tầng tự động hóa hoàn chỉnh & An toàn:** Toàn bộ vòng đời từ IAM Role, 5 Lambda Functions, API Gateway HTTP API v2 đến Function URLs (BUFFERED & RESPONSE_STREAM) được tự động hóa hoàn toàn kèm cơ chế `trap cleanup` khôi phục cấu hình gốc.
 2. **Độ tin cậy của bộ kiểm thử:** 
