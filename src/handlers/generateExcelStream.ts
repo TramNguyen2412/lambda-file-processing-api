@@ -4,8 +4,8 @@ import { generateExcel } from '../utils/excelGenerator';
 const DEFAULT_ROWS = 10_000;
 const MAX_ROWS     = 500_000;
 
-// Maximum size for synthetic streaming test (Lambda Function URL response hard quota is 200 MB)
-const MAX_SYNTHETIC_MB = 195;
+// Maximum size for synthetic streaming test (allows testing near and slightly beyond the 200 MB quota)
+const MAX_SYNTHETIC_MB = 250;
 const DEFAULT_CHUNK_KB = 64;
 
 /**

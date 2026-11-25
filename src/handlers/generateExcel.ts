@@ -70,6 +70,7 @@ export const handler = async (
     headers: {
       'Content-Type':        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       'Content-Disposition': `attachment; filename="${filename}"`,
+      'X-Lambda-Request-Id': context.awsRequestId,
       'X-Row-Count':         String(rows),
       'X-File-Size-MB':      String(result.fileSizeMB),
       'X-File-Size-Bytes':   String(result.fileSizeBytes),
