@@ -1,20 +1,20 @@
 # AWS Lambda File Processing API
 
-> **Mini-project tìm hiểu giới hạn kích thước, cách upload và xuất file Excel trên AWS Lambda (Node.js 24 & TypeScript)**
+> **Mini-project tìm hiểu giới hạn kích thước, cơ chế upload và xuất tệp Excel trên AWS Lambda (Node.js 24 & TypeScript)**
 
 ---
 
 ## 1. Giới thiệu
 
-Khi xử lý file nhị phân (như Excel `.xlsx`) trực tiếp trên AWS Lambda mà không dùng S3 hay database trung gian, mình sẽ gặp một số giới hạn về kích thước request/response, việc dữ liệu bị phình lên khi mã hóa Base64, và timeout.
+Khi xử lý tệp nhị phân (như bảng tính Excel `.xlsx`) trực tiếp trên AWS Lambda mà không sử dụng dịch vụ lưu trữ trung gian (S3, cơ sở dữ liệu), hệ thống thường gặp các giới hạn kỹ thuật về kích thước tải trọng (payload), hiện tượng tăng dung lượng do mã hóa Base64 và thời gian thực thi (timeout).
 
-Đây là một **mini-project nhỏ** dùng để thử nghiệm và đo thực tế các giới hạn đó trên AWS Serverless.
+Đây là một **mini-project thử nghiệm** nhằm triển khai và đo đạc thực tế các giới hạn nêu trên trong môi trường AWS Serverless.
 
-### Những điểm chính được thử nghiệm
-1. **Giới hạn khi upload file:** So sánh thực tế giữa API Gateway HTTP API (mức chặn 10 MB) và giới hạn gọi đồng bộ của AWS Lambda (6 MiB = `6,291,456 bytes`).
-2. **Chi phí Base64:** Khi gửi file nhị phân qua API Gateway v2 hoặc Function URL, nội dung bị chuyển sang Base64 (+33.3% dung lượng), kéo kích thước file thô tối đa có thể upload xuống còn khoảng ~4.50 MiB (`~4.72 MB`).
-3. **Cách trả file về (`BUFFERED` vs `RESPONSE_STREAM`):** So sánh giữa trả một cục đồng bộ (bị chặn ở 6 MiB) và truyền từng phần qua Function URL `RESPONSE_STREAM` (tài liệu AWS ghi tối đa 200 MB).
-4. **Kiểm tra nguồn gốc lỗi `HTTP 413`:** Kết hợp API Gateway Access Logs, cURL và CloudWatch Logs của Lambda để biết request bị chặn trước khi vào Stage, lúc gọi Lambda, hay trong code handler.
+### Các nội dung chính được thử nghiệm
+1. **Giới hạn kích thước khi upload:** Đối chiếu thực tế giữa API Gateway HTTP API (mức chặn 10 MB) và giới hạn gọi đồng bộ của AWS Lambda (6 MiB = `6,291,456 bytes`).
+2. **Chi phí mã hóa Base64:** Khi gửi tệp nhị phân qua API Gateway v2 hoặc Function URL, nội dung được chuyển sang Base64 (+33.3% dung lượng), làm kích thước tệp thô tối đa có thể upload giảm xuống còn khoảng ~4.50 MiB (`~4.72 MB`).
+3. **Cơ chế trả tệp về (`BUFFERED` và `RESPONSE_STREAM`):** So sánh giữa phản hồi đồng bộ một lần (giới hạn 6 MiB) và truyền từng phần qua Function URL `RESPONSE_STREAM` (tài liệu AWS công bố tối đa 200 MB).
+4. **Truy vết nguồn gốc lỗi `HTTP 413`:** Kết hợp API Gateway Access Logs, cURL và CloudWatch Logs của Lambda để phân biệt yêu cầu bị từ chối trước giai đoạn Stage Integration, tại bước gọi Lambda hay trong logic xử lý của handler.
 
 ### Công nghệ sử dụng
 * **Runtime:** Node.js 24 (`nodejs24.x`), viết bằng TypeScript.
@@ -78,7 +78,7 @@ flowchart TD
 ### Các hàm Lambda trong bài thực hành
 * **`health` & `info`:** Kiểm tra trạng thái chạy của Lambda và trả về danh sách các giới hạn AWS để tra cứu nhanh.
 * **`upload-excel`:** Giải mã Base64, tách file từ `multipart/form-data` (nếu có), chặn file > 5 MiB (`MAX_PARSE_BYTES`), kiểm tra 4 byte đầu `PK\x03\x04` của file `.xlsx`, rồi đọc số dòng/cột và 5 dòng mẫu.
-* **`generate-excel`:** Tạo file `.xlsx` trong RAM, chuyển sang Base64 và trả về 1 cục đồng bộ.
+* **`generate-excel`:** Tạo tệp `.xlsx` trong bộ nhớ, chuyển sang Base64 và trả về đồng bộ trong một phản hồi duy nhất.
 * **`generate-excel-stream`:** Tạo file `.xlsx` hoặc bơm dữ liệu giả lập (`?mode=synthetic`) theo từng chunk `64 KiB` qua `awslambda.streamifyResponse`.
 
 ---
