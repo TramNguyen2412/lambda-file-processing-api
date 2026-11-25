@@ -94,9 +94,9 @@ export const handler = async (
     diagnosticType: 'UPLOAD_BODY_DECODED',
     awsRequestId,
     apiGwRequestId,
-    rawDecodedBytes: rawBuffer.byteLength,
-    extractedFileBytes: buffer.byteLength,
-    isMemoryGuardPassed: buffer.byteLength <= MAX_PARSE_BYTES,
+    rawDecodedBytes: rawBuffer.byteLength, //DL sau decode 
+    extractedFileBytes: buffer.byteLength, //DL sau khi extract file 
+    isMemoryGuardPassed: buffer.byteLength <= MAX_PARSE_BYTES, // co vuot qua memory guard
     reachesFileValidation: buffer.byteLength <= MAX_PARSE_BYTES,
   }));
 
@@ -115,8 +115,8 @@ export const handler = async (
       body: JSON.stringify({
         error: 'File exceeds maximum parse limit (5 MB).',
         receivedBytes: buffer.byteLength,
-        receivedMB:    Math.round((buffer.byteLength / 1024 / 1024) * 1000) / 1000,
-        maxAllowedMB:  MAX_PARSE_BYTES / 1024 / 1024,
+        receivedMB: Math.round((buffer.byteLength / 1024 / 1024) * 1000) / 1000,
+        maxAllowedMB: MAX_PARSE_BYTES / 1024 / 1024,
         note: 'Payload successfully traversed API Gateway and Lambda synchronous invocation boundary before handler rejected it.',
       }),
     };
@@ -146,8 +146,8 @@ export const handler = async (
         success: false,
         error: 'Uploaded file is not a valid Excel (.xlsx) file (missing ZIP/PK header).',
         payloadMetrics: {
-          receivedBytes:   buffer.byteLength,
-          receivedMB:      Math.round((buffer.byteLength / 1024 / 1024) * 1000) / 1000,
+          receivedBytes: buffer.byteLength,
+          receivedMB: Math.round((buffer.byteLength / 1024 / 1024) * 1000) / 1000,
           isBase64Encoded: event.isBase64Encoded,
           contentType,
         },
@@ -162,7 +162,7 @@ export const handler = async (
 
   try {
     const parseResult = await parseExcel(buffer);
-    const elapsedMs   = Date.now() - startTime;
+    const elapsedMs = Date.now() - startTime;
 
     console.log(JSON.stringify({
       diagnosticType: 'UPLOAD_PARSE_SUCCESS',
@@ -180,15 +180,15 @@ export const handler = async (
       body: JSON.stringify({
         success: true,
         file: {
-          receivedBytes:   buffer.byteLength,
-          receivedMB:      Math.round((buffer.byteLength / 1024 / 1024) * 1000) / 1000,
+          receivedBytes: buffer.byteLength,
+          receivedMB: Math.round((buffer.byteLength / 1024 / 1024) * 1000) / 1000,
           isBase64Encoded: event.isBase64Encoded,
           contentType,
         },
         excel: parseResult,
         performance: {
-          parseElapsedMs:  elapsedMs,
-          lambdaMemoryMB:  context.memoryLimitInMB,
+          parseElapsedMs: elapsedMs,
+          lambdaMemoryMB: context.memoryLimitInMB,
           remainingTimeMS: context.getRemainingTimeInMillis(),
         },
       }),
