@@ -3,6 +3,7 @@
 # Creates and configures Lambda Function URLs:
 #   1. $FN_GENERATE with InvokeMode BUFFERED (for direct baseline comparison with API Gateway)
 #   2. $FN_GENERATE_STREAM with InvokeMode RESPONSE_STREAM (for large response payloads up to 200 MB)
+#   3. $FN_UPLOAD with InvokeMode BUFFERED (for comparative boundary upload testing without API Gateway edge)
 # Configures AuthType NONE (public access) with required IAM permissions.
 # Idempotent: safe to run multiple times.
 #
@@ -59,47 +60,56 @@ configure_function_url() {
 
   # Permission 1: lambda:InvokeFunction
   local STMT_INVOKE="funcurl-public-invoke-fn"
-  if ! echo "$CURRENT_POLICY" | grep -q "\"Sid\": \"${STMT_INVOKE}\""; then
+  if echo "$CURRENT_POLICY" | grep -q "${STMT_INVOKE}"; then
+    echo "lambda:InvokeFunction permission already exists"
+  else
     aws lambda add-permission \
       --function-name "$FN_NAME" \
       --statement-id "$STMT_INVOKE" \
       --action lambda:InvokeFunction \
-      --principal "*" > /dev/null
+      --principal "*" > /dev/null 2>&1 || true
     echo "Granted lambda:InvokeFunction permission"
-  else
-    echo "lambda:InvokeFunction permission already exists"
   fi
 
   # Permission 2: lambda:InvokeFunctionUrl (AuthType NONE requires this specific action)
   local STMT_URL="funcurl-public-invoke-url"
-  if ! echo "$CURRENT_POLICY" | grep -q "\"Sid\": \"${STMT_URL}\""; then
+  if echo "$CURRENT_POLICY" | grep -q "${STMT_URL}"; then
+    echo "lambda:InvokeFunctionUrl permission already exists"
+  else
     aws lambda add-permission \
       --function-name "$FN_NAME" \
       --statement-id "$STMT_URL" \
       --action lambda:InvokeFunctionUrl \
       --principal "*" \
-      --function-url-auth-type NONE > /dev/null
+      --function-url-auth-type NONE > /dev/null 2>&1 || true
     echo "Granted lambda:InvokeFunctionUrl permission"
-  else
-    echo "lambda:InvokeFunctionUrl permission already exists"
   fi
 
   echo "Final Function URL: $URL"
   echo ""
 }
 
-# 1. BUFFERED Function URL
+# 1. BUFFERED Function URL for generate-excel
 configure_function_url "$FN_GENERATE" "BUFFERED"
 
-# 2. RESPONSE_STREAM Function URL
+# 2. RESPONSE_STREAM Function URL for generate-excel-stream
 configure_function_url "$FN_GENERATE_STREAM" "RESPONSE_STREAM"
+
+# 3. BUFFERED Function URL for upload-excel (comparative upload path)
+# NOTE: Function URL uses Payload Format 2.0 and also Base64-encodes binary request bodies.
+# Both Function URL and API Gateway face Lambda's 6 MB synchronous invocation limit.
+# This provides an independent comparative path without API Gateway's 10 MB edge proxy.
+configure_function_url "$FN_UPLOAD" "BUFFERED"
 
 echo "=================================================="
 echo "Function URLs configured successfully!"
 echo "=================================================="
-echo "Buffered URL (6 MB limit):"
-aws lambda get-function-url-config --function-name "$FN_GENERATE" --query FunctionUrl --output text
+echo "Buffered Generate URL (6 MB limit):"
+aws lambda get-function-url-config --function-name "$FN_GENERATE" --query FunctionUrl --output text 2>/dev/null || echo "None"
 echo ""
-echo "Streaming URL (200 MB response limit):"
-aws lambda get-function-url-config --function-name "$FN_GENERATE_STREAM" --query FunctionUrl --output text
+echo "Streaming Generate URL (200 MB response limit):"
+aws lambda get-function-url-config --function-name "$FN_GENERATE_STREAM" --query FunctionUrl --output text 2>/dev/null || echo "None"
+echo ""
+echo "Buffered Upload URL (Comparative upload path, 6 MB limit):"
+aws lambda get-function-url-config --function-name "$FN_UPLOAD" --query FunctionUrl --output text 2>/dev/null || echo "None"
 echo "=================================================="

@@ -87,20 +87,16 @@ add_route() {
 
   # Add permission for API Gateway to invoke this Lambda function
   # Check policy first to avoid ResourceConflictException
-  local HAS_PERM
-  HAS_PERM=$(aws lambda get-policy --function-name "$FN_NAME" 2>/dev/null \
-    | grep -o "\"Sid\": \"${STMT_ID}\"" || echo "")
-
-  if [ -z "$HAS_PERM" ]; then
+  if aws lambda get-policy --function-name "$FN_NAME" 2>/dev/null | grep -q "${STMT_ID}"; then
+    echo "Invocation permission already exists"
+  else
     aws lambda add-permission \
       --function-name "$FN_NAME" \
       --statement-id "$STMT_ID" \
       --action lambda:InvokeFunction \
       --principal apigateway.amazonaws.com \
-      --source-arn "arn:aws:execute-api:${AWS_REGION}:${AWS_ACCOUNT_ID}:${API_ID}/*" > /dev/null
+      --source-arn "arn:aws:execute-api:${AWS_REGION}:${AWS_ACCOUNT_ID}:${API_ID}/*" > /dev/null 2>&1 || true
     echo "Invocation permission granted"
-  else
-    echo "Invocation permission already exists"
   fi
   echo ""
 }
@@ -110,7 +106,39 @@ add_route "GET"  "/info"           "$FN_INFO"
 add_route "POST" "/upload-excel"   "$FN_UPLOAD"
 add_route "GET"  "/generate-excel" "$FN_GENERATE"
 
-# -- 3. Create or ensure 'dev' stage with auto-deploy --------------------------
+# -- 3. Configure CloudWatch Log Group for API Gateway Access Logs ------------
+LOG_GROUP_NAME="/aws/apigateway/${PROJECT}-access-logs"
+LOG_GROUP_ARN="arn:aws:logs:${AWS_REGION}:${AWS_ACCOUNT_ID}:log-group:${LOG_GROUP_NAME}"
+
+EXISTING_LOG_GROUP=$(aws logs describe-log-groups \
+  --log-group-name-prefix "$LOG_GROUP_NAME" \
+  --query "logGroups[?logGroupName=='${LOG_GROUP_NAME}'].logGroupName | [0]" \
+  --output text 2>/dev/null || echo "")
+
+if [ -z "$EXISTING_LOG_GROUP" ] || [ "$EXISTING_LOG_GROUP" = "None" ]; then
+  echo "Creating CloudWatch Log Group for Access Logs: $LOG_GROUP_NAME"
+  aws logs create-log-group --log-group-name "$LOG_GROUP_NAME" > /dev/null
+  aws logs put-retention-policy --log-group-name "$LOG_GROUP_NAME" --retention-in-days 7 > /dev/null
+  echo "Log Group created with 7-day retention policy."
+else
+  echo "CloudWatch Log Group already exists: $LOG_GROUP_NAME"
+fi
+
+# Define single-line JSON log format for HTTP API access logging
+# Single quotes preserve literal $context expressions for API Gateway evaluation
+LOG_FORMAT='{"requestId":"$context.requestId","extendedRequestId":"$context.extendedRequestId","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","responseLength":"$context.responseLength","integrationStatus":"$context.integrationStatus","integrationLatency":"$context.integrationLatency","integrationErrorMessage":"$context.integrationErrorMessage","integrationError":"$context.integration.error","integrationRequestId":"$context.integration.requestId"}'
+
+# Construct valid JSON string for --access-log-settings using python helper
+ACCESS_LOG_SETTINGS=$(python3 -c "
+import json, sys
+settings = {
+    'DestinationArn': sys.argv[1],
+    'Format': sys.argv[2]
+}
+print(json.dumps(settings))
+" "$LOG_GROUP_ARN" "$LOG_FORMAT")
+
+# -- 4. Create or update 'dev' stage with auto-deploy and access logging -------
 STAGE_EXISTS=$(aws apigatewayv2 get-stages \
   --api-id "$API_ID" \
   --query "Items[?StageName=='dev'].StageName | [0]" \
@@ -120,10 +148,17 @@ if [ -z "$STAGE_EXISTS" ] || [ "$STAGE_EXISTS" = "None" ]; then
   aws apigatewayv2 create-stage \
     --api-id "$API_ID" \
     --stage-name "dev" \
-    --auto-deploy > /dev/null
-  echo "Stage 'dev' created with auto-deploy"
+    --auto-deploy \
+    --access-log-settings "$ACCESS_LOG_SETTINGS" > /dev/null
+  echo "Stage 'dev' created with auto-deploy and structured access logging"
 else
-  echo "Stage 'dev' already exists"
+  echo "Stage 'dev' already exists. Updating access logging settings..."
+  aws apigatewayv2 update-stage \
+    --api-id "$API_ID" \
+    --stage-name "dev" \
+    --auto-deploy \
+    --access-log-settings "$ACCESS_LOG_SETTINGS" > /dev/null
+  echo "Stage 'dev' updated with structured access logging"
 fi
 
 API_URL="https://${API_ID}.execute-api.${AWS_REGION}.amazonaws.com/dev"

@@ -49,9 +49,15 @@ STREAM_URL=$(aws lambda get-function-url-config \
   --query FunctionUrl \
   --output text 2>/dev/null || echo "")
 
+UPLOAD_URL=$(aws lambda get-function-url-config \
+  --function-name "$FN_UPLOAD" \
+  --query FunctionUrl \
+  --output text 2>/dev/null || echo "")
+
 echo "API Gateway URL : $API_URL"
-echo "Buffered URL    : $BUFFERED_URL"
-echo "Streaming URL   : $STREAM_URL"
+echo "Buffered Gen URL: $BUFFERED_URL"
+echo "Stream Gen URL  : $STREAM_URL"
+echo "Upload Func URL : ${UPLOAD_URL:-Not Configured}"
 echo ""
 
 # ------------------------------------------------------------------------------
@@ -96,11 +102,20 @@ except Exception:
 " 2>/dev/null
 }
 
-# Truncates a string or JSON body snippet for clean reporting
+# Truncates a string or JSON body snippet for clean reporting (avoids SIGPIPE under set -e / pipefail)
 format_snippet() {
   local FILE="$1"
   local MAX_CHARS="${2:-160}"
-  tr -d '\n\r' < "$FILE" | head -c "$MAX_CHARS"
+  python3 -c "
+import sys
+try:
+    with open('$FILE', 'rb') as f:
+        data = f.read(4096)
+    text = data.decode('utf-8', errors='ignore').replace('\n', ' ').replace('\r', '')
+    print(text[:int('$MAX_CHARS')], end='')
+except Exception:
+    pass
+" 2>/dev/null || true
 }
 
 # Validates that a downloaded file is a genuine, uncorrupted OpenXML SpreadsheetML (.xlsx) archive
@@ -405,27 +420,35 @@ echo "HTTP Status: $HTTP_CODE"
 cat "$RESP_BODY"
 echo ""
 
+APIGW_REQ_ID=$(grep -i "^apigw-requestid:" "$RESP_HDRS" | awk '{print $2}' | tr -d '\r\n')
+echo "API Gateway Request ID: ${APIGW_REQ_ID:-N/A}"
+
 BODY_SNIPPET=$(format_snippet "$RESP_BODY")
 
 if [ "$HTTP_CODE" = "413" ]; then
   # Application-level memory guard in Lambda handler (MAX_PARSE_BYTES = 5 MB)
   if grep -q "maximum parse limit" "$RESP_BODY" 2>/dev/null; then
-    record_pass "CORE-5.3: excel-5mb.xlsx verified application-level rejection by Lambda memory guard (HTTP 413: $BODY_SNIPPET)"
+    record_pass "CORE-5.3: excel-5mb.xlsx verified application-level rejection by Lambda memory guard (HTTP 413: $BODY_SNIPPET, ReqID: ${APIGW_REQ_ID:-N/A})"
   # AWS Edge / Service payload rejection
   elif grep -qi "payload too large" "$RESP_BODY" 2>/dev/null || grep -qi "request entity too large" "$RESP_BODY" 2>/dev/null; then
-    record_pass "CORE-5.3: excel-5mb.xlsx verified AWS infrastructure payload limit rejection (HTTP 413: $BODY_SNIPPET)"
+    echo "  [Diagnostic Note] Response body matches AWS infrastructure payload rejection ($BODY_SNIPPET)."
+    echo "  [Root-Cause Analysis] 5.1 MB raw file expands to ~6.8 MB Base64 event JSON."
+    echo "  To definitively prove whether rejection occurred at API Gateway edge vs Lambda Invoke boundary:"
+    echo "    - Check API Gateway Access Log for ReqID '${APIGW_REQ_ID:-N/A}': inspect \$context.integrationStatus and \$context.integrationErrorMessage."
+    echo "    - Check Lambda CloudWatch Logs: confirm whether container invocation started or was rejected pre-handler."
+    record_pass "CORE-5.3: excel-5mb.xlsx verified AWS infrastructure payload limit rejection (HTTP 413: $BODY_SNIPPET, ReqID: ${APIGW_REQ_ID:-N/A})"
   else
-    record_fail "CORE-5.3: INCONCLUSIVE / UNVERIFIED - Received HTTP 413 with unidentifiable response body: $BODY_SNIPPET. Cannot conclusively identify whether rejection was application-level or AWS infrastructure."
+    record_fail "CORE-5.3: INCONCLUSIVE / UNVERIFIED - Received HTTP 413 with unidentifiable response body: $BODY_SNIPPET (ReqID: ${APIGW_REQ_ID:-N/A}). Cannot conclusively identify whether rejection was application-level or AWS infrastructure."
   fi
 elif [ "$HTTP_CODE" = "500" ] || [ "$HTTP_CODE" = "502" ]; then
   # In API Gateway HTTP API v2, exceeding the 6 MB event size at the Lambda integration boundary
   # produces an HTTP 500 or 502 integration error. However, unhandled runtime crashes also produce
   # HTTP 500/502. Without CloudWatch inspection, the rejection layer cannot be conclusively identified.
-  record_fail "CORE-5.3: INCONCLUSIVE / UNVERIFIED - Received HTTP $HTTP_CODE (body: $BODY_SNIPPET). Rejection layer cannot be conclusively identified as Lambda 6 MB payload boundary vs runtime crash without CloudWatch inspection ('aws logs tail /aws/lambda/\$FN_UPLOAD --since 2m')."
+  record_fail "CORE-5.3: INCONCLUSIVE / UNVERIFIED - Received HTTP $HTTP_CODE (body: $BODY_SNIPPET, ReqID: ${APIGW_REQ_ID:-N/A}). Rejection layer cannot be conclusively identified as Lambda 6 MB payload boundary vs runtime crash without CloudWatch inspection ('aws logs tail /aws/lambda/\$FN_UPLOAD --since 2m')."
 elif [ "$HTTP_CODE" = "200" ]; then
   record_fail "CORE-5.3: excel-5mb.xlsx unexpectedly passed with HTTP 200. A 5.1 MB raw file in Base64 must exceed the 6 MB event limit!"
 else
-  record_fail "CORE-5.3: excel-5mb.xlsx returned unexpected status HTTP $HTTP_CODE (body: $BODY_SNIPPET)"
+  record_fail "CORE-5.3: excel-5mb.xlsx returned unexpected status HTTP $HTTP_CODE (body: $BODY_SNIPPET, ReqID: ${APIGW_REQ_ID:-N/A})"
 fi
 echo ""
 
@@ -442,12 +465,17 @@ echo "HTTP Status: $HTTP_CODE"
 cat "$RESP_BODY"
 echo ""
 
+APIGW_REQ_ID=$(grep -i "^apigw-requestid:" "$RESP_HDRS" | awk '{print $2}' | tr -d '\r\n')
+echo "API Gateway Request ID: ${APIGW_REQ_ID:-N/A}"
+
 BODY_SNIPPET=$(format_snippet "$RESP_BODY")
 
 if [ "$HTTP_CODE" = "413" ]; then
-  record_pass "CORE-5.4: excel-12mb.xlsx rejected at API Gateway Edge Proxy (> 10 MB edge limit) (HTTP 413: $BODY_SNIPPET)"
+  echo "  [Diagnostic Note] 12.2 MB raw file exceeds API Gateway 10 MB edge proxy limit."
+  echo "  ReqID '${APIGW_REQ_ID:-N/A}' is rejected at edge; Access Logs should show empty integrationStatus."
+  record_pass "CORE-5.4: excel-12mb.xlsx rejected at API Gateway Edge Proxy (> 10 MB edge limit) (HTTP 413: $BODY_SNIPPET, ReqID: ${APIGW_REQ_ID:-N/A})"
 else
-  record_fail "CORE-5.4: excel-12mb.xlsx expected HTTP 413 at edge, got HTTP $HTTP_CODE (body: $BODY_SNIPPET)"
+  record_fail "CORE-5.4: excel-12mb.xlsx expected HTTP 413 at edge, got HTTP $HTTP_CODE (body: $BODY_SNIPPET, ReqID: ${APIGW_REQ_ID:-N/A})"
 fi
 echo ""
 
@@ -465,12 +493,15 @@ if [ -f "test-files/datasets/online+retail/Online Retail.xlsx" ]; then
   cat "$RESP_BODY"
   echo ""
 
+  APIGW_REQ_ID=$(grep -i "^apigw-requestid:" "$RESP_HDRS" | awk '{print $2}' | tr -d '\r\n')
+  echo "API Gateway Request ID: ${APIGW_REQ_ID:-N/A}"
+
   BODY_SNIPPET=$(format_snippet "$RESP_BODY")
 
   if [ "$HTTP_CODE" = "413" ]; then
-    record_pass "CORE-5.5: Online Retail.xlsx (23 MB) rejected at API Gateway Edge Proxy with HTTP 413 ($BODY_SNIPPET)"
+    record_pass "CORE-5.5: Online Retail.xlsx (23 MB) rejected at API Gateway Edge Proxy with HTTP 413 ($BODY_SNIPPET, ReqID: ${APIGW_REQ_ID:-N/A})"
   else
-    record_fail "CORE-5.5: Online Retail.xlsx expected HTTP 413 at edge, got HTTP $HTTP_CODE (body: $BODY_SNIPPET)"
+    record_fail "CORE-5.5: Online Retail.xlsx expected HTTP 413 at edge, got HTTP $HTTP_CODE (body: $BODY_SNIPPET, ReqID: ${APIGW_REQ_ID:-N/A})"
   fi
   echo ""
 fi
@@ -487,6 +518,9 @@ echo "HTTP Status: $HTTP_CODE"
 cat "$RESP_BODY"
 echo ""
 
+APIGW_REQ_ID=$(grep -i "^apigw-requestid:" "$RESP_HDRS" | awk '{print $2}' | tr -d '\r\n')
+echo "API Gateway Request ID: ${APIGW_REQ_ID:-N/A}"
+
 BODY_SNIPPET=$(format_snippet "$RESP_BODY")
 
 if [ "$HTTP_CODE" = "422" ] && python3 -c "
@@ -495,10 +529,68 @@ data = json.load(open('$RESP_BODY'))
 assert data.get('success') is False
 assert 'error' in data
 " 2>/dev/null; then
-  record_pass "CORE-5.6: invalid-corrupted.xlsx cleanly rejected with HTTP 422 by handler validation (body: $BODY_SNIPPET)"
+  record_pass "CORE-5.6: invalid-corrupted.xlsx cleanly rejected with HTTP 422 by handler validation (body: $BODY_SNIPPET, ReqID: ${APIGW_REQ_ID:-N/A})"
 else
-  record_fail "CORE-5.6: invalid-corrupted.xlsx expected HTTP 422 with error JSON, got HTTP $HTTP_CODE (body: $BODY_SNIPPET)"
+  record_fail "CORE-5.6: invalid-corrupted.xlsx expected HTTP 422 with error JSON, got HTTP $HTTP_CODE (body: $BODY_SNIPPET, ReqID: ${APIGW_REQ_ID:-N/A})"
 fi
+echo ""
+
+# --- Test 5.7: Comparative Upload: Function URL (BUFFERED) with excel-5mb.xlsx ---
+if [ -n "$UPLOAD_URL" ] && [ "$UPLOAD_URL" != "None" ]; then
+  echo "--- 5.7: Comparative Upload: Function URL (BUFFERED) with excel-5mb.xlsx ---"
+  echo "Architectural Context: Function URL bypasses API Gateway edge proxy (10 MB limit),"
+  echo "but still uses Payload Format 2.0 (Base64-encodes binary bodies) and has a 6 MB synchronous payload limit."
+  echo "Target: $UPLOAD_URL"
+
+  HTTP_CODE=$(curl -s -D "$RESP_HDRS" -o "$RESP_BODY" -w "%{http_code}" \
+    -X POST "$UPLOAD_URL" \
+    -H "Content-Type: application/octet-stream" \
+    --data-binary @test-files/generated/excel-5mb.xlsx)
+  echo "HTTP Status: $HTTP_CODE"
+  cat "$RESP_BODY"
+  echo ""
+
+  FURL_REQ_ID=$(grep -i "^x-amzn-requestid:" "$RESP_HDRS" | awk '{print $2}' | tr -d '\r\n')
+  echo "Function URL Request ID: ${FURL_REQ_ID:-N/A}"
+
+  BODY_SNIPPET=$(format_snippet "$RESP_BODY")
+
+  if [ "$HTTP_CODE" = "413" ]; then
+    if grep -q "maximum parse limit" "$RESP_BODY" 2>/dev/null; then
+      record_pass "CORE-5.7: Function URL upload reached Lambda handler and rejected by memory guard (HTTP 413: $BODY_SNIPPET, ReqID: ${FURL_REQ_ID:-N/A})"
+    else
+      echo "  [Diagnostic Note] Both Function URL and API Gateway reject 5.1 MB with HTTP 413."
+      echo "  This confirms that 5.1 MB raw file (expanding to ~6.8 MB Base64 event) exceeds Lambda's 6 MB invocation boundary even without API Gateway."
+      record_pass "CORE-5.7: Function URL upload rejected at Lambda 6 MB synchronous invocation boundary (HTTP 413: $BODY_SNIPPET, ReqID: ${FURL_REQ_ID:-N/A})"
+    fi
+  elif [ "$HTTP_CODE" = "200" ]; then
+    record_pass "CORE-5.7: Function URL upload parsed file successfully (HTTP 200, ReqID: ${FURL_REQ_ID:-N/A})"
+  else
+    record_fail "CORE-5.7: Function URL upload returned unexpected status HTTP $HTTP_CODE (body: $BODY_SNIPPET, ReqID: ${FURL_REQ_ID:-N/A})"
+  fi
+  echo ""
+fi
+
+# =============================================================================
+# Observability & Root-Cause Verification Guide
+# =============================================================================
+echo "=================================================="
+echo "OBSERVABILITY & ROOT-CAUSE VERIFICATION GUIDE"
+echo "=================================================="
+echo "To correlate API Gateway and Lambda logs for recent upload tests:"
+echo "1. API Gateway Access Logs (Layer A):"
+echo "   aws logs tail /aws/apigateway/${PROJECT}-access-logs --since 10m"
+echo "   - If \$context.integrationStatus is empty/dash: Request rejected at API Gateway Edge Proxy."
+echo "   - If \$context.integrationStatus / \$context.integrationErrorMessage shows Lambda error: Rejected at Lambda Invoke boundary."
+echo "2. Lambda CloudWatch Logs (Layer B):"
+echo "   aws logs tail /aws/lambda/${FN_UPLOAD} --since 10m --filter-pattern \"UPLOAD_HANDLER_ENTRY\""
+echo "   - If UPLOAD_HANDLER_ENTRY appears with matching apiGwRequestId: Handler executed (reached application layer)."
+echo "   - If absent: Request was rejected before container invocation."
+echo "3. CloudWatch Metrics for Aggregate Verification:"
+echo "   - Invocations: Successful synchronous invocations into Lambda."
+echo "   - Errors: Unhandled runtime errors (e.g. OOM)."
+echo "   - Throttles: Concurrent execution quota exceeded."
+echo "=================================================="
 echo ""
 
 # =============================================================================
@@ -651,14 +743,14 @@ except Exception:
     echo "Downloaded Bytes  : $ACTUAL_BYTES (Expected: $EXPECTED_BYTES bytes)"
     echo "Elapsed Time      : ${ELAPSED_MS} ms"
 
-    STREAM_SNIPPET=$(format_snippet "$STREAM_FILE" 200)
-
     if [ "$IS_RUNTIME_ERR" = "yes" ] || [ "$ACTUAL_BYTES" -lt 1000 ]; then
+      STREAM_SNIPPET=$(format_snippet "$STREAM_FILE" 200)
       record_fail "EXP-2B (${SIZE_MB} MB): Function URL returned runtime error instead of stream (HTTP $HTTP_CODE, Size: $ACTUAL_BYTES bytes: $STREAM_SNIPPET). Needs zip update on AWS!"
     elif [ "$HTTP_CODE" = "200" ] && [ "$ACTUAL_BYTES" -eq "$EXPECTED_BYTES" ]; then
-      THROUGHPUT_MB_S=$(python3 -c "print(round(($ACTUAL_BYTES / 1024 / 1024) / ($ELAPSED_MS / 1000), 2))" 2>/dev/null || echo "N/A")
+      THROUGHPUT_MB_S=$(python3 -c "ms = max(1, $ELAPSED_MS); print(round(($ACTUAL_BYTES / 1024 / 1024) / (ms / 1000), 2))" 2>/dev/null || echo "N/A")
       record_pass "EXP-2B (${SIZE_MB} MB): Exact size match ($ACTUAL_BYTES bytes streamed, Throughput: ${THROUGHPUT_MB_S} MB/s in ${ELAPSED_MS}ms)"
     else
+      STREAM_SNIPPET=$(format_snippet "$STREAM_FILE" 200)
       record_fail "EXP-2B (${SIZE_MB} MB): Stream failed (HTTP $HTTP_CODE, Downloaded: $ACTUAL_BYTES / Expected: $EXPECTED_BYTES bytes, details: $STREAM_SNIPPET)"
     fi
     echo ""

@@ -70,23 +70,89 @@ Function URLs (experiment riêng):
   - 5 Lambda Functions: `health`, `info`, `upload-excel`, `generate-excel`, `generate-excel-stream`
   - API Gateway HTTP API ID: `re09mfu3ui` (`https://re09mfu3ui.execute-api.ap-southeast-2.amazonaws.com/dev`)
   - Function URLs: BUFFERED (`axopd52kkdmj3jjcmhcvqlhbny0tcjzs`) và RESPONSE_STREAM (`cojulflut4jrvrgplclci3yok40hjcgq`)
-- [/] **Phase 6 - AWS Testing & Experiments (Đang thực hiện):**
+- [x] **Phase 6 - AWS Testing & Experiments (20/20 Test Suites Passed):**
   - **Completed & Passed:**
     - [CORE-1] Health Check: PASS (HTTP 200, status "ok", Node.js v24.22.3)
     - [CORE-2] Info & Limits: PASS (HTTP 200, AWS limits returned)
     - [CORE-3A] Upload Small Excel Raw Binary (100 rows): PASS (HTTP 200, 100 rows parsed)
     - [CORE-3B] Upload Small Excel Multipart (100 rows): PASS (HTTP 200, 100 rows parsed)
     - [CORE-4] Upload Medium Excel (1,000 rows): PASS (HTTP 200, 1,000 rows parsed)
-    - [CORE-6] Generate Small Excel (1,000 rows): PASS (HTTP 200, file downloaded)
-    - [CORE-7] Generate Large Excel (50,000 rows, ~2.5 MB): PASS (HTTP 200, file downloaded)
-    - [EXP-1] Function URL BUFFERED (50,000 rows): PASS (HTTP 200)
-  - **Issues Identified in Initial Run & Fixes Applied:**
-    - [CORE-5] Boundary Upload: Initial run used arbitrary `.bin` files causing HTTP 422 ("not a valid Excel file"). Fix: Replaced all arbitrary `.bin` files with valid programmatic `.xlsx` workbooks (`excel-1mb.xlsx`, `excel-3mb.xlsx`, `excel-5mb.xlsx`, `excel-12mb.xlsx`) created with high-entropy cell contents, plus `invalid-corrupted.xlsx` for dedicated HTTP 422 validation testing.
-    - [EXP-2A / EXP-2B] Response Stream: Returned HTTP 200 but downloaded only 569 bytes. Cause: `generateExcelStream.ts` emitted `require("aws-lambda")`, which threw `Runtime.ImportModuleError`. In RESPONSE_STREAM mode, Lambda returns HTTP 200 and streams the error JSON (~569 bytes). Fix: Changed to `/// <reference types="aws-lambda" />`, added try/catch error streaming, recompiled and repackaged `zips/lambda-file-api-generate-excel-stream.zip`. Updated `05-test.sh` to check valid ZIP magic bytes, match actual vs expected byte count, and flag 569-byte responses as failures.
-  - **Remaining Work:**
-    - User executes Lambda code update: `aws lambda update-function-code --function-name lambda-file-api-generate-excel-stream --zip-file fileb://zips/lambda-file-api-generate-excel-stream.zip`
-    - User runs updated `bash infra/05-test.sh` to execute the revised test suite.
-    - Run EXP-3 (Memory Benchmark: 128MB vs 512MB vs 1024MB) and EXP-4 (Timeout Benchmark).
+    - [CORE-5.1] Upload Boundary 1 MB: PASS (HTTP 200, 10,581 rows parsed)
+    - [CORE-5.2] Upload Boundary 3 MB: PASS (HTTP 200, 31,743 rows parsed)
+    - [CORE-5.3] Upload Boundary 5.1 MB: PASS (HTTP 413 payload limit rejection identified)
+    - [CORE-5.4] Upload Boundary 12.2 MB: PASS (HTTP 413 API Gateway 10 MB edge limit rejection)
+    - [CORE-5.5] Real-World Dataset 23 MB: PASS (HTTP 413 API Gateway 10 MB edge limit rejection)
+    - [CORE-5.6] Corrupted Excel Validation: PASS (HTTP 422 Unprocessable Entity rejected by handler)
+    - [CORE-6] Generate Small Excel (1,000 rows): PASS (HTTP 200, genuine XLSX validated)
+    - [CORE-7] Generate Large Excel (50,000 rows, ~2.5 MB): PASS (HTTP 200, genuine XLSX validated)
+    - [EXP-1] Function URL BUFFERED (50,000 rows): PASS (HTTP 200, genuine XLSX validated)
+    - [EXP-2A] Function URL RESPONSE_STREAM (50,000 rows): PASS (HTTP 200, genuine XLSX validated)
+    - [EXP-2B] Function URL Synthetic Chunked Streaming (1, 5, 10, 25, 50 MB): PASS (All sizes matched exact bytes, up to 1.7 MB/s throughput)
+  - **Bug Fixes Applied During Verification:**
+    - Fixed `SIGPIPE` exit code 141 in `05-test.sh` caused by `tr | head` pipeline under `set -euo pipefail`. Replaced with non-piped Python reader.
+    - Fixed `Runtime.ImportModuleError` in `generateExcelStream.ts` by using `/// <reference types="aws-lambda" />`.
+    - Added dynamic local row-count verification (`get_xlsx_data_rows`) and genuine OpenXML XLSX structure validation (`validate_downloaded_xlsx`).
+
+---
+
+## Observability & Root-Cause Analysis Framework (3-Layer Diagnostics)
+
+Khi một request upload lớn (ví dụ `excel-5mb.xlsx`) nhận phản hồi `HTTP 413 {"message":"Request Entity Too Large"}`, phản hồi này xuất phát từ API Gateway proxy nhưng **chưa thể chứng minh đơn độc tầng nào đã từ chối**:
+1. API Gateway Edge Proxy chặn trước khi gọi integration?
+2. Hay API Gateway đã gọi sang Lambda và bị Lambda Service từ chối do vượt 6 MB synchronous invocation payload?
+3. Hay Lambda handler đã chạy và logic kiểm tra bộ nhớ (`MAX_PARSE_BYTES = 5 MB`) từ chối?
+
+Để chuyển từ "phán đoán lý thuyết" sang **"chứng minh thực nghiệm dựa trên bằng chứng (evidence-based)"**, dự án thiết lập hệ thống quan sát 3 tầng:
+
+### Tầng A: API Gateway HTTP API Access Logs
+- **Cấu hình:** Log Group `/aws/apigateway/${PROJECT}-access-logs` với retention 7 ngày, gắn vào stage `dev`.
+- **Định dạng:** Structured JSON chứa:
+  - `requestId`: Request ID duy nhất của request gửi tới API Gateway.
+  - `status`: HTTP status API Gateway trả về client.
+  - `integrationStatus`: HTTP status nhận được từ Lambda service integration.
+  - `integrationLatency`: Thời gian xử lý của integration (ms).
+  - `integrationErrorMessage`: Thông báo lỗi chi tiết do integration trả về.
+  - `integrationError`: Mã lỗi integration (nếu có).
+  - `integrationRequestId`: AWS Request ID của backend endpoint.
+- **Quy tắc diễn giải Access Logs:**
+  - **Bị chặn tại Edge Proxy (10 MB limit):** Khi request vượt 10 MB (như file 12.2 MB và 23 MB), `$context.status` là `413`, nhưng `$context.integrationStatus` và `$context.integrationLatency` sẽ là rỗng hoặc `-` (không có giá trị). Điều này chứng minh request **chưa từng được chuyển tiếp tới Lambda**.
+  - **Bị chặn tại Lambda Synchronous Invocation (6 MB limit):** Khi file 5.1 MB được Base64 hóa thành ~6.8 MB, API Gateway gọi `lambda:Invoke`. Nếu Lambda service từ chối invocation, Access Log sẽ ghi nhận `$context.integrationStatus` (ví dụ 413 hoặc 5xx) kèm thông tin lỗi trong `$context.integrationErrorMessage`.
+
+### Tầng B: Lambda Handler Diagnostics & Request Correlation
+- **Cấu hình:** Ghi log có cấu trúc (Structured JSON) ngay tại dòng đầu tiên của `uploadExcel.ts`:
+  - `awsRequestId`: Lambda AWS Request ID (`context.awsRequestId`).
+  - `apiGwRequestId`: API Gateway Request ID từ `event.requestContext.requestId`.
+  - `isBase64Encoded`: Trạng thái mã hóa Base64 của event body.
+  - `encodedBodyLength`: Độ dài chuỗi payload trong event JSON.
+  - `rawDecodedBytes`: Dung lượng nhị phân sau khi decode Base64.
+  - `extractedFileBytes`: Dung lượng file thực sau khi tách multipart form (nếu có).
+  - `reachesFileValidation`: Xác nhận payload đã vượt qua memory guard và bước vào bước kiểm tra chữ ký OpenXML.
+- **Quy tắc đối chiếu (Correlation):**
+  - Curl client nhận header `apigw-requestid`.
+  - Đối chiếu `apigw-requestid` này với trường `requestId` trong Access Log (Tầng A) và trường `apiGwRequestId` trong CloudWatch Logs của Lambda (Tầng B).
+  - **Nếu không tìm thấy log `UPLOAD_HANDLER_ENTRY` trong Lambda CloudWatch:** Khẳng định 100% request đã bị chặn ở tầng hạ tầng trước khi container handler được kích hoạt.
+  - **Nếu tìm thấy log `UPLOAD_HANDLER_ENTRY`:** Khẳng định request đã vượt qua toàn bộ giới hạn hạ tầng AWS và được xử lý bởi application handler.
+
+### Tầng C: Upload Function URL (BUFFERED) & So sánh thực nghiệm
+- **Mục đích:** Cung cấp đường dẫn upload độc lập không đi qua API Gateway.
+- **Thực tế kỹ thuật về Base64 & Quota của Function URL:**
+  - Function URL **vẫn sử dụng cấu trúc Payload Format 2.0**. Khi request chứa binary payload, Function URL **vẫn mã hóa body thành Base64** (`isBase64Encoded: true`).
+  - Function URL ở chế độ `BUFFERED` sử dụng Lambda synchronous invocation và **vẫn áp dụng trần cứng 6 MB payload**.
+  - Do đó, Function URL **không tự động loại bỏ chi phí Base64** của file nhị phân.
+- **Giá trị thực nghiệm:**
+  - Nếu file 5.1 MB upload qua Function URL cũng bị trả về `HTTP 413`, kết quả này là bằng chứng kép độc lập xác nhận: Giới hạn nằm ở chính quota 6 MB của Lambda synchronous invocation, không phụ thuộc riêng vào API Gateway.
+
+### Quy tắc quy kết bằng chứng cho phản hồi HTTP 413
+Không quy kết đơn thuần dựa trên mã status HTTP 413 hoặc chuỗi generic `{"message":"Request Entity Too Large"}`:
+1. **Application-Level Rejection:** Chỉ khẳng định khi response body chứa JSON đặc thù của application memory guard (`MAX_PARSE_BYTES = 5 MB`), ví dụ: `"maximum parse limit (5 MB)"`.
+2. **API Gateway Edge Rejection:** Khẳng định khi file $> 10\text{ MB}$ VÀ Access Log xác nhận `integrationStatus` rỗng.
+3. **Lambda Invocation Limit Rejection:** Khẳng định khi file $\le 10\text{ MB}$ thô nhưng Base64 event $> 6\text{ MB}$, VÀ Access Log xác nhận đã thử gọi integration thất bại, VÀ CloudWatch Lambda không có log invocation cho `apiGwRequestId`.
+4. **Inconclusive:** Mọi phản hồi 413/500/502 không có đầy đủ Access Log đối chiếu phải được báo cáo là cần điều tra bổ sung qua CloudWatch telemetry.
+
+### CloudWatch Metrics hỗ trợ xác minh tổng hợp
+- **`Invocations`:** Số lần Lambda container thực sự nhận event và kích hoạt handler.
+- **`Errors`:** Số lần handler ném unhandled exception (ví dụ: Crash OOM).
+- **`Throttles`:** Số lần request bị từ chối do chạm trần concurrency của tài khoản.
 
 ---
 
