@@ -6,16 +6,29 @@
   "scripts": {
     "build:check": "tsc --noEmit",
     "build": "tsc",
+    "build:layer": "npm run build && node scripts/build-layer.mjs",
     "package": "bash scripts/package.sh",
     "gen:test-files": "bash scripts/generate-test-files.sh",
-    "test:local": "node scripts/test-local.mjs"
+    "test:local": "node scripts/test-local.mjs",
+    "test:phase2": "node scripts/test-phase2-local.mjs",
+    "test:phase3": "node scripts/test-phase3-local.mjs",
+    "test:phase4": "node scripts/test-phase4-local.mjs",
+    "test:phase5": "node scripts/test-phase5-local.mjs",
+    "test:phase6": "node scripts/test-phase6-local.mjs"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.145",
     "@types/node": "^22.0.0",
+    "@types/pg": "^8.23.1",
     "typescript": "^5.5.0"
   },
   "dependencies": {
-    "exceljs": "^4.4.0"
+    "@aws-sdk/client-s3": "^3.1178.0",
+    "@aws-sdk/client-secrets-manager": "^3.1178.0",
+    "@aws-sdk/client-sns": "^3.1178.0",
+    "@aws-sdk/client-sqs": "^3.1178.0",
+    "@aws-sdk/s3-request-presigner": "^3.1178.0",
+    "exceljs": "^4.4.0",
+    "pg": "^8.23.1"
   }
 }

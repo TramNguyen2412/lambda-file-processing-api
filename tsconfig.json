@@ -6,10 +6,17 @@
     "outDir": "./dist",
     "rootDir": "./src",
     "strict": true,
+    "declaration": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "baseUrl": ".",
+    "paths": {
+      "pg-helper": ["src/layer/pg-helper.ts"],
+      "logger": ["src/layer/logger.ts"],
+      "response-builder": ["src/layer/response-builder.ts"]
+    }
   },
   "include": ["src/**/*"],
   "exclude": ["node_modules", "dist", "scripts"]
