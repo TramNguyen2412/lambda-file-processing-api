@@ -52,3 +52,78 @@ export async function parseExcel(buffer: Buffer): Promise<ParseResult> {
     previewRows,
   };
 }
+
+export interface ParsedExcelRow {
+  rowIndex: number;
+  data: Record<string, unknown>;
+}
+
+export interface FullParseResult {
+  sheetName: string;
+  headers: string[];
+  rowCount: number;
+  columnCount: number;
+  rows: ParsedExcelRow[];
+}
+
+function normalizeCellValue(val: unknown): unknown {
+  if (val instanceof Date) {
+    return val.toISOString();
+  }
+  if (val && typeof val === 'object' && 'result' in val) {
+    return (val as { result: unknown }).result;
+  }
+  return val ?? null;
+}
+
+/**
+ * Parse every data row of the first worksheet in an Excel (.xlsx) Buffer.
+ * Validates the ZIP/PK signature first so corrupted files fail fast.
+ */
+export async function parseAllExcelRows(buffer: Buffer): Promise<FullParseResult> {
+  if (buffer.byteLength < 4 || buffer[0] !== 0x50 || buffer[1] !== 0x4b) {
+    throw new Error('Invalid Excel file: missing ZIP/OpenXML signature');
+  }
+
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(buffer as any);
+
+  const sheet = workbook.worksheets[0];
+  if (!sheet) {
+    throw new Error('File Excel không có worksheet nào');
+  }
+
+  const headers: string[] = [];
+  sheet.getRow(1).eachCell((cell, colNum) => {
+    const raw = String(cell.value ?? '').trim();
+    headers[colNum - 1] = raw || `col${colNum}`;
+  });
+
+  if (headers.length === 0) {
+    throw new Error('File Excel không có header row');
+  }
+
+  const rows: ParsedExcelRow[] = [];
+  for (let r = 2; r <= sheet.rowCount; r++) {
+    const excelRow = sheet.getRow(r);
+    if (!excelRow.hasValues) {
+      continue;
+    }
+    const data: Record<string, unknown> = {};
+    excelRow.eachCell({ includeEmpty: false }, (cell, colNum) => {
+      const header = headers[colNum - 1] ?? `col${colNum}`;
+      data[header] = normalizeCellValue(cell.value);
+    });
+    if (Object.keys(data).length > 0) {
+      rows.push({ rowIndex: r - 1, data });
+    }
+  }
+
+  return {
+    sheetName: sheet.name,
+    headers,
+    rowCount: rows.length,
+    columnCount: headers.length,
+    rows,
+  };
+}
