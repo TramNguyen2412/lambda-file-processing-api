@@ -1,9 +1,9 @@
-# Báo cáo Thực nghiệm: Tìm hiểu và Đo đạc Giới hạn AWS Serverless khi Xử lý File Excel
+# Báo cáo Thực nghiệm Tổng hợp: Hệ thống Xử lý File Serverless trên AWS
 
-> **Mini-project:** AWS Lambda File Processing API  
-> **Môi trường thực thi:** Node.js 24.x (`nodejs24.x`), TypeScript, AWS Lambda, API Gateway HTTP API, Lambda Function URLs  
-> **Phạm vi báo cáo:** Toàn bộ quá trình dựng hạ tầng, kiểm thử ranh giới và đo hiệu năng từ Giai đoạn 01 đến Giai đoạn 06 (`infra/01-iam.sh` → `infra/06-benchmark.sh`)  
-> **Trạng thái thực nghiệm:** 21/21 kịch bản kiểm thử đạt chuẩn (PASS) ở Giai đoạn 05 và hoàn thành các phép đo hiệu năng Giai đoạn 06 (TEST A, B, C, D)  
+> **Dự án:** `lambda-file-processing-api` — AWS Serverless File Processing System  
+> **Đối tượng xem xét:** Báo cáo kỹ thuật phục vụ review cùng Mentor (Mr. Thang)  
+> **Runtime & Nền tảng:** Node.js 24 (`nodejs24.x`), TypeScript, AWS Lambda, API Gateway HTTP API, Lambda Function URLs (Phase 1); mở rộng sang S3, RDS PostgreSQL, SQS, SNS, EventBridge Scheduler, Lambda Layer & Cache (Phase 2–6)  
+> **Trạng thái tổng thể:** Phase 1 **Hoàn thành & Đã kiểm thử trên AWS** (21/21 test cases PASS + Benchmark Giai đoạn 06) · Phase 2–6 **Chưa triển khai (Planned)**
 
 > **Quy ước đơn vị & ký hiệu số trong báo cáo:**  
 > * **MB (Megabyte, hệ thập phân):** $1\text{ MB} = 1{,}000{,}000\text{ bytes}$.  
@@ -12,18 +12,42 @@
 
 ---
 
-## 1. Mở đầu
+## 1. Tổng quan Dự án (Project Overview)
 
-### 1.1. Mục đích thực nghiệm
-Trong quá trình thiết kế các giải pháp điện toán không máy chủ (Serverless), việc tiếp nhận và xuất dữ liệu tệp tin nhị phân (đặc biệt là bảng tính Excel `.xlsx`) luôn phải đối mặt với các giới hạn nghiêm ngặt về kích thước tải trọng (payload quotas) và thời gian thực thi (execution timeout). Dự án này được thiết lập nhằm:
+### 1.1. Mục tiêu và Phạm vi
+Dự án xây dựng một hệ thống xử lý file Excel (`.xlsx`) tiến hóa theo từng phase trên AWS Serverless. Mỗi phase bổ sung một nhóm AWS services nhằm giải quyết một vấn đề kỹ thuật cụ thể phát sinh từ thực nghiệm ở phase trước, thay vì gộp nhiều dịch vụ một cách hình thức:
+
+| Phase | Trạng thái | Thành phần chính | Câu hỏi kỹ thuật trọng tâm |
+| :---: | :---: | :--- | :--- |
+| **Phase 1** | **Tested successfully (AWS)** | API Gateway HTTP API, AWS Lambda, Function URLs | Giới hạn thực tế của Lambda khi xử lý file nhị phân trong RAM (không dùng S3/DB) là gì? |
+| **Phase 2** | **Not yet tested (Planned)** | Amazon S3, S3 Event Notifications, RDS PostgreSQL | Làm thế nào vượt giới hạn payload ~4.50 MiB, xử lý bất đồng bộ theo event và lưu dữ liệu có cấu trúc với ACID? |
+| **Phase 3** | **Not yet tested (Planned)** | Amazon SQS, Dead-Letter Queue (DLQ) | Làm thế nào tách tiếp nhận request khỏi xử lý, kiểm soát retry theo Visibility Timeout và cô lập lỗi vào DLQ? |
+| **Phase 4** | **Not yet tested (Planned)** | Amazon SNS → SQS Fan-out, Outbox pattern | Khi nhiều consumer độc lập cần nhận cùng một sự kiện, fan-out và message filtering hoạt động thế nào? |
+| **Phase 5** | **Not yet tested (Planned)** | EventBridge Scheduler | Làm thế nào tự động hóa dọn dẹp, phát hiện stuck jobs và phục hồi outbox định kỳ? |
+| **Phase 6** | **Not yet tested (Planned)** | Lambda Layer, Container Cache, ElastiCache (optional) | Code reuse (Layer), in-memory per-instance cache và shared network cache khác nhau ra sao về scope, lifetime và chi phí? |
+
+### 1.2. Kiến trúc Tổng thể Tiến hóa
+* **Hiện trạng đã triển khai và kiểm thử (Phase 1):** Client gửi request qua **API Gateway HTTP API (v2)** hoặc **Lambda Function URLs** (`BUFFERED` / `RESPONSE_STREAM`) tới 5 Lambda functions chuyên biệt (`health`, `info`, `upload-excel`, `generate-excel`, `generate-excel-stream`), xử lý hoàn toàn trong bộ nhớ.
+* **Hướng mở rộng theo kế hoạch (Phase 2–6):** Tích hợp **S3 Presigned URL** + **S3 Event** + **RDS PostgreSQL** (Phase 2), bổ sung **SQS + DLQ** cho reprocessing (Phase 3), **SNS → SQS Fan-out** qua bảng Outbox (Phase 4), **EventBridge Scheduler** cho bảo trì và phát hiện stuck jobs (Phase 5), và **Lambda Layer + Caching** (Phase 6). Chi tiết kiến trúc mục tiêu được quản lý trong kế hoạch triển khai nội bộ.
+
+---
+
+## 2. Phase 1 — API Gateway và AWS Lambda (`infra/01-iam.sh` → `infra/06-benchmark.sh`)
+
+> **Trạng thái Phase 1:** **Deployed to AWS & Tested successfully** — 21/21 kịch bản kiểm thử đạt chuẩn (PASS) ở Giai đoạn 05 và hoàn thành 4 nhóm đo hiệu năng Giai đoạn 06 (TEST A, B, C, D; riêng TEST C bước đối chiếu trực tiếp Lambda CloudWatch Log Group ghi nhận `[INCONCLUSIVE]` do không truy xuất được trong cửa sổ polling).
+
+### 2.1. Mở đầu & Mục đích thực nghiệm Phase 1
+
+#### Mục đích thực nghiệm
+Trong quá trình thiết kế các giải pháp điện toán không máy chủ (Serverless), việc tiếp nhận và xuất dữ liệu tệp tin nhị phân (đặc biệt là bảng tính Excel `.xlsx`) luôn phải đối mặt với các giới hạn nghiêmặt về kích thước tải trọng (payload quotas) và thời gian thực thi (execution timeout). Phase 1 được thiết lập nhằm:
 * Xây dựng một môi trường Serverless chuẩn mực trên AWS phục vụ đo lường độc lập, hoàn toàn không sử dụng tầng lưu trữ trung gian S3, Database hay giao diện Frontend.
 * Triển khai hệ thống gồm 5 hàm AWS Lambda chuyên biệt thực thi trên runtime Node.js 24 (`nodejs24.x`).
 * Thiết lập 2 cổng giao tiếp độc lập: **Amazon API Gateway HTTP API** và **AWS Lambda Function URLs** (với 2 chế độ `BUFFERED` và `RESPONSE_STREAM`).
 * Khảo sát thực nghiệm ranh giới tải lên (Upload Boundary) và cơ chế tải về (Response Streaming) đối với các file Excel có dung lượng từ nhỏ (vài chục KB) đến rất lớn (~23 MB).
 * Phân tích và truy vết nguồn gốc từ chối của các mã lỗi `HTTP 413 Payload Too Large` thông qua hệ thống quan sát đa tầng (Observability: Access Logs, cURL Transport Traces, Lambda Handler Logs).
 
-### 1.2. Trình tự và mối liên hệ giữa các giai đoạn
-Quá trình thực nghiệm được tự động hóa qua 6 giai đoạn có tính kế thừa chặt chẽ:
+#### Trình tự và mối liên hệ giữa các giai đoạn Phase 1
+Quá trình thực nghiệm Phase 1 được tự động hóa qua 6 giai đoạn có tính kế thừa chặt chẽ:
 1. **`01-iam.sh` (Cấp quyền tối thiểu):** Khởi tạo IAM Execution Role bảo đảm Lambda chỉ có quyền ghi log vào CloudWatch, tuân thủ nguyên tắc Least Privilege.
 2. **`02-lambda.sh` (Triển khai tính toán):** Đóng gói và phát hành 5 Lambda Functions với các mức cấp phát bộ nhớ (128 MB – 1,024 MB) và thời gian chạy phù hợp.
 3. **`03-apigateway.sh` (Thiết lập cổng API):** Cấu hình API Gateway HTTP API v2, tích hợp proxy với Lambda, mở Stage `dev` và kích hoạt hệ thống ghi nhật ký truy cập (Stage Access Logging).
@@ -33,7 +57,7 @@ Quá trình thực nghiệm được tự động hóa qua 6 giai đoạn có t�
 
 ---
 
-## 2. Chi tiết từng giai đoạn triển khai (Giai đoạn 01 – 04)
+### 2.2. Chi tiết từng giai đoạn triển khai (Giai đoạn 01 – 04)
 
 ### Giai đoạn 01: Thiết lập IAM Execution Role (`infra/01-iam.sh`)
 
@@ -154,7 +178,7 @@ Cấu hình 3 Function URLs với quyền công khai (`AuthType NONE`) và cấp
 
 ---
 
-## 3. Giai đoạn 05: Kiểm thử chức năng và Khảo sát Giới hạn Kiến trúc (`infra/05-test.sh`)
+### 2.3. Giai đoạn 05: Kiểm thử chức năng và Khảo sát Giới hạn Kiến trúc (`infra/05-test.sh`)
 
 Giai đoạn kiểm thử bao gồm **21 kịch bản kiểm thử độc lập**, được chia thành 4 nhóm nghiệp vụ chính (5 kịch bản Nhóm 1 + 7 kịch bản Nhóm 2 + 4 kịch bản Nhóm 3 + 5 mốc kích thước Nhóm 4 = 21 kịch bản). Toàn bộ 21/21 kịch bản đều đạt trạng thái **PASS** (kết quả thực tế trả về khớp với kỳ vọng thiết kế kiến trúc).
 
@@ -318,7 +342,7 @@ Thực nghiệm đo lường từ lần chạy hoàn tất 21/21 của `infra/05
 
 ---
 
-## 4. Giai đoạn 06: Đo lường Hiệu năng & Khảo sát Cấu hình Chuyên sâu (`infra/06-benchmark.sh`)
+### 2.4. Giai đoạn 06: Đo lường Hiệu năng & Khảo sát Cấu hình Chuyên sâu (`infra/06-benchmark.sh`)
 
 Giai đoạn 06 tập trung vào các phép đo định lượng về độ trễ, khả năng co giãn CPU theo Memory, xác minh lỗi timeout và khảo sát ngưỡng truyền dòng gần 200 MiB. Toàn bộ số liệu dưới đây được ghi nhận trực tiếp từ lần thực thi chuẩn hóa cuối cùng (Run 3), với cơ chế đối chiếu Request ID chính xác, tách biệt header/body và kiểm định toàn vẹn mẫu byte:
 
@@ -402,7 +426,7 @@ Tất cả các gói kiểm thử đều tách riêng hoàn toàn HTTP Headers (
 
 ---
 
-## 5. Tổng kết Kết quả Thực nghiệm
+### 2.5. Tổng kết Kết quả Thực nghiệm Phase 1
 
 Qua 6 giai đoạn thực hiện từ dựng hạ tầng đến đo hiệu năng, mini-project ghi nhận các kết quả thực tế sau:
 
@@ -422,7 +446,7 @@ Qua 6 giai đoạn thực hiện từ dựng hạ tầng đến đo hiệu năng
 
 ---
 
-## 6. Phạm vi Hoàn thành Dự án
+### 2.6. Phạm vi Hoàn thành Phase 1
 
 * [x] **Giai đoạn 01 (`01-iam.sh`):** Khởi tạo Execution Role và kiểm soát quyền CloudWatch Logs tối thiểu.
 * [x] **Giai đoạn 02 (`02-lambda.sh`):** Đóng gói và triển khai 5 Lambda Functions trên Node.js 24.
@@ -430,3 +454,211 @@ Qua 6 giai đoạn thực hiện từ dựng hạ tầng đến đo hiệu năng
 * [x] **Giai đoạn 04 (`04-function-url.sh`):** Thiết lập Function URLs chế độ BUFFERED và RESPONSE_STREAM.
 * [x] **Giai đoạn 05 (`05-test.sh`):** Thực thi 21 kịch bản kiểm thử biên, phân tích Access Logs và xác nhận ranh giới hạ tầng.
 * [x] **Giai đoạn 06 (`06-benchmark.sh`):** Hoàn tất chuẩn hóa đo lường hiệu năng Upload (100k rows), Memory Scaling (128/512/1,024 MB kèm CloudWatch REPORT), **Timeout Verification (API Gateway Access Log; Lambda CloudWatch Log chưa đối chiếu trực tiếp)**, và Response Streaming (10–205 MiB).
+
+---
+
+## 3. Phase 2 — S3 Event và PostgreSQL
+
+> **Trạng thái:** **Deployed to AWS & Tested (Normal flow verified on AWS; Local test suite 8/8 PASS)** · Một số kịch bản biên trên AWS (concurrent duplicate invoke, xác minh CloudWatch `Invocations=0` cho `processed/loop-test/`) mới kiểm chứng qua local simulator, chưa đối chiếu metric trên AWS.
+
+### 3.1. Mục tiêu và Kiến trúc
+Phase 1 đã chứng minh upload đồng bộ qua API Gateway / Lambda `BUFFERED` bị giới hạn ở **~4.50 MiB raw** do Base64 inflation (+33.3%) làm vượt trần 6 MiB (`6,291,456 bytes`). Phase 2 giải quyết giới hạn này bằng kiến trúc **Presigned URL + Event-driven S3 + RDS PostgreSQL**:
+
+* **`POST /upload-to-s3` (`src/handlers/uploadToS3.ts`):** Tạo bản ghi `file_jobs` (`status='pending'`) trong PostgreSQL và trả về S3 Presigned PUT URL (`input/{fileId}/original.xlsx`, TTL 300s) để client upload trực tiếp lên S3.
+* **`lambda-file-api-s3-processor` (`src/handlers/s3Processor.ts` + `src/lib/excelProcessor.ts`):** Nhận S3 `ObjectCreated` event (filter `prefix: input/`, `suffix: .xlsx`), thực hiện atomic claim, tải file, parse toàn bộ rows (`parseAllExcelRows`), lưu `file_records` trong transaction (`PoolClient`), upload kết quả lên `processed/{fileId}/result.xlsx`, và cập nhật `file_jobs.status = 'processed'`.
+* **`GET /file/{id}` & `GET /file/{id}/rows` (`src/handlers/fileQuery.ts`):** Truy vấn trạng thái job và dữ liệu phân trang (`limit`/`offset`).
+* **Database Schema (`sql/schema.sql`):** Tạo 7 bảng (`file_jobs`, `file_records`, `processing_jobs`, `outbox`, `audit_logs`, `daily_summaries`, `consumer_processed_events`) và các partial/lookup indexes.
+
+### 3.2. Cơ chế Idempotency, Transaction và Chống vòng lặp
+1. **Atomic Claim:** `UPDATE file_jobs SET status='processing', started_at=NOW() WHERE file_id=$1 AND status='pending' RETURNING file_id` đảm bảo khi S3 gửi trùng event đồng thời, chỉ 1 invocation claim thành công; invocation còn lại nhận `0 rows` và thoát sớm.
+2. **PostgreSQL Transaction (`src/lib/db.ts` – `withTransaction`):** Mượn một `PoolClient` cố định (`pool.connect()`), chạy `BEGIN` → batch `INSERT INTO file_records ... ON CONFLICT (file_id, row_index) DO NOTHING` → `UPDATE file_jobs SET status='uploading'` → `COMMIT` (hoặc `ROLLBACK` khi lỗi) và `client.release()` trong `finally`.
+3. **Phân loại lỗi:** Lỗi terminal (`NoSuchKey`, file không có chữ ký ZIP/PK hoặc malformed) chuyển `status='failed'` và return cleanly (tránh retry vô ích); lỗi transient reset `status='pending'` và throw để Lambda async retry.
+4. **Chống vòng lặp vô hạn:** S3 Event Notification chỉ kích hoạt trên `prefix: input/`, `suffix: .xlsx`; handler đồng thời kiểm tra lại prefix/suffix ở code trước khi xử lý (`processed/` bị bỏ qua).
+
+### 3.3. Kết quả Kiểm thử Cục bộ (`npm run test:phase2`)
+Kiểm thử trên mã biên dịch `dist/` kết hợp in-memory transactional PostgreSQL & S3 simulator (chưa kết nối AWS/RDS thật):
+
+| Kịch bản kiểm thử | Kết quả | Chi tiết xác minh |
+| :--- | :---: | :--- |
+| **1. Normal flow (`POST /upload-to-s3` → S3 Event)** | **PASS** | Job chuyển `pending → processing → uploading → processed`; 50 rows lưu DB; `processed/{fileId}/result.xlsx` hợp lệ |
+| **2. Option B (Direct S3 upload không qua API)** | **PASS** | `INSERT ... ON CONFLICT DO NOTHING` tự tạo `file_jobs` và xử lý thành công 50 rows |
+| **3. Concurrent duplicate S3 events (`Promise.all`)** | **PASS** | Chỉ 1/2 invocation claim được job; `file_records` có đúng 50 rows (không bị nhân đôi) |
+| **4. Transaction rollback khi lỗi DB giữa chừng** | **PASS** | `ROLLBACK` giữ `0` orphaned records trong `file_records`; job reset về `pending` |
+| **5. Terminal errors (Corrupted XLSX & `NoSuchKey`)** | **PASS** | `file_jobs.status = 'failed'`, ghi `error_message`, return cleanly |
+| **6. Infinite loop guard (`processed/` & `.txt`)** | **PASS** | Bỏ qua hoàn toàn, không tạo job hay xử lý |
+| **7. Query API (`GET /file/:id`, `/rows`, `404`, `400`)** | **PASS** | Trả đúng metadata, phân trang `limit=10&offset=5`, `404` khi không tồn tại, `400` khi UUID sai |
+
+### 3.4. Kết quả Triển khai & Kiểm thử Thực tế trên AWS (`ap-southeast-2`, Account `963348789774`)
+
+* **Hạ tầng đã triển khai (`infra/10-s3-rds.sh`, `11-db-schema.sh`, `12-s3-processor.sh`):**
+  * **S3 Bucket:** `lambda-file-api-data-963348789774` (S3 Event Notification `s3:ObjectCreated:*` với filter `prefix: input/`, `suffix: .xlsx`).
+  * **VPC & Security Groups:** `vpc-00c2860082f941555`, `SG_LAMBDA=sg-066d3bf704547d093`, `SG_RDS=sg-0d0fa4a581252ed88`, S3 Gateway Endpoint, Secrets Manager Interface Endpoint (`subnet-0310fa3048f370809`).
+  * **RDS PostgreSQL & Secrets Manager:** `lambda-file-api-db` (`db.t3.micro`, private, 3-AZ DB Subnet Group `lambda-file-api-db-subnet-group`), secret `lambda-file-api/db-credentials`. Schema `sql/schema.sql` (7 bảng) được áp dụng thành công qua one-shot VPC Lambda `lambda-file-api-db-init` (`{"ok":true,"sqlLength":4154}`).
+  * **Lambda Functions (VPC) & API GW Routes:** `upload-to-s3` (128 MB, 30s), `s3-processor` (512 MB, 120s), `file-query` (256 MB, 30s) gắn vào API `re09mfu3ui`.
+* **Kết quả chạy `infra/13-s3-test.sh` trên AWS:**
+  * **Normal Flow (`medium-1000rows.xlsx`):** `POST /upload-to-s3` tạo `fileId = 52420ee1-e837-4bfb-983a-4381025dccda` → PUT qua presigned URL → sau 15s, `GET /file/{id}` trả `status: "processed"`, `rowCount: 1000`, `processedKey: "processed/52420ee1-e837-4bfb-983a-4381025dccda/result.xlsx"`; `GET /file/{id}/rows?limit=5&offset=0` trả `returnedCount: 5`, `total: 1000`.
+  * **Infinite Loop Guard:** Đã upload `processed/loop-test/result.xlsx` lên S3; bước đối chiếu CloudWatch `Invocations = 0` trên AWS chưa thực hiện trực tiếp.
+
+---
+
+## 4. Phase 3 — SQS và Dead-Letter Queue
+
+> **Trạng thái:** **Deployed to AWS & Tested (Producer/Consumer, SQS VPC Endpoint, terminal error ack & DLQ=0 verified on AWS; Local test suite 5/5 PASS)** · Kịch bản transient retry 3 lần vào DLQ và `180s` stale-claim recovery mới kiểm chứng qua local test suite, chưa kích hoạt lỗi transient thật trên AWS.
+
+### 4.1. Mục tiêu và Kiến trúc
+Phase 2 xử lý file tự động ngay khi upload lên S3, nhưng chưa có cơ chế để client chủ động yêu cầu xử lý lại (reprocess) các job `failed` hoặc `timeout`. Phase 3 bổ sung hàng đợi bất đồng bộ **Amazon SQS + DLQ**, tái sử dụng toàn bộ pipeline `processExcelFile` (`src/lib/excelProcessor.ts`):
+
+* **`POST /process-job` (`src/handlers/jobProducer.ts`):** Chuyển đổi nguyên tử `file_jobs.status IN ('failed', 'timeout') → 'pending'` (trả `404` nếu không tồn tại, `409 Conflict` cho `pending`/`processing`/`uploading`/`processed`), phát message `{ jobId, fileId, s3Key, enqueuedAt, requestedBy }` vào SQS (`202 Accepted`), và thực hiện compensating rollback về `'failed'` (`503`) nếu `SendMessage` lỗi.
+* **`lambda-file-api-job-consumer` (`src/handlers/jobConsumer.ts`):** Nhận message qua SQS Event Source Mapping (`BatchSize=1`, `Timeout=150s`, `VisibilityTimeout=900s = 6× Lambda timeout`), sử dụng bảng `processing_jobs` (stale recovery `180s`) để phân biệt duplicate message (`status='completed'` → acknowledge an toàn) với message lỗi cần retry (`status='failed'` → cho phép tăng `attempts`), sau đó claim `file_jobs` và gọi `processExcelFile({ mode: 'sqs', alreadyClaimed: true, throwOnTerminalError: true })`.
+* **DLQ & Phân loại lỗi:** Lỗi terminal (`NoSuchKey`, file hỏng) được ghi nhận `'failed'` và acknowledge ngay (không đẩy vào DLQ vô ích); lỗi transient (`S3 503`, lỗi mạng/DB) throw error để SQS retry tối đa `maxReceiveCount = 3` trước khi chuyển sang `lambda-file-api-jobs-dlq` (retention 7 ngày).
+
+### 4.2. Kết quả Kiểm thử Cục bộ (`npm run test:phase3`)
+
+| Kịch bản kiểm thử | Kết quả | Chi tiết xác minh |
+| :--- | :---: | :--- |
+| **1. Producer guards (`404`, `409`, `503` rollback)** | **PASS** | Từ chối `pending`/`processed` với `409`; revert về `'failed'` nếu `SendMessage` lỗi (`503`) |
+| **2. Normal reprocess & Duplicate SQS message** | **PASS** | Job chuyển `failed → processed`; `processing_jobs` chuyển `completed`; message trùng lần 2 bị bỏ qua (`attempts=1`) |
+| **3. Transient retry exhaustion (1..3 → DLQ) & Redrive** | **PASS** | 3 lần lỗi transient tăng `attempts=3` và throw để vào DLQ; sau khi redrive thành công, job chuyển `completed` / `processed` |
+| **4. Terminal error ack (Corrupted XLSX)** | **PASS** | Ghi nhận `processing_jobs='failed'` & `file_jobs='failed'`, return cleanly (không retry vào DLQ) |
+
+### 4.3. Kết quả Triển khai & Kiểm thử Thực tế trên AWS (`ap-southeast-2`, Account `963348789774`)
+
+* **Hạ tầng đã triển khai (`infra/20-sqs.sh`, `21-sqs-lambdas.sh`):**
+  * **SQS Queues:** `lambda-file-api-jobs` (`VisibilityTimeout=900s`, `maxReceiveCount=3`) và `lambda-file-api-jobs-dlq` (retention 7 ngày).
+  * **SQS Interface VPC Endpoint:** Tạo trong `vpc-00c2860082f941555` (`subnet-0310fa3048f370809`) cho phép `job-producer` trong VPC gọi `sqs:SendMessage`.
+  * **Lambda & API GW:** `lambda-file-api-job-producer` (128 MB, 30s, VPC) gắn route `POST /process-job` trên API `re09mfu3ui`; `lambda-file-api-job-consumer` (512 MB, 150s, VPC) gắn SQS Event Source Mapping (`BatchSize=1`).
+* **Kết quả kiểm thử trên AWS (`infra/22-sqs-test.sh`):**
+  * **Tạo job lỗi đầu vào (`f954db7e-0c6d-4086-b413-da38df110d3a`):** Upload payload không hợp lệ (`not-an-xlsx`) qua `POST /upload-to-s3` → `s3-processor` ghi nhận `status: "failed"`, `errorMessage: "Invalid Excel file: missing ZIP/OpenXML signature"`.
+  * **Reprocess qua `POST /process-job`:** Producer trả `202` với `jobId: "e64a5729-e2bd-4640-ad02-84e02b4e0b11"`, `status: "queued"`. Sau 15s, `job-consumer` xử lý xong, giữ nguyên `status: "failed"` (lỗi terminal không thể tự phục hồi) và acknowledge message thành công.
+  * **Duplicate SQS message & DLQ:** Đã gửi 2 message trùng `jobId: "26e57dc6-5a36-4ee3-a4e2-4f2d516fc5c6"` lên `lambda-file-api-jobs`; `ApproximateNumberOfMessages` trên `lambda-file-api-jobs-dlq` là `0` (xác nhận lỗi terminal không bị đẩy sang DLQ).
+
+---
+
+## 5. Phase 4 — SNS Fan-out
+
+> **Trạng thái:** **Deployed to AWS & Tested (SNS Topic, Filter Policies, SNS VPC Endpoint, Outbox `notificationStatus="published"` verified on AWS; Local test suite 5/5 PASS)** · Truy vấn trực tiếp bảng `audit_logs` / `daily_summaries` và kịch bản tắt `summary-consumer` bằng `reserved-concurrent-executions=0` mới kiểm chứng ở local test suite, chưa kiểm tra trực tiếp trên RDS/AWS.
+
+### 5.1. Mục tiêu và Kiến trúc
+Khi `SNS_TOPIC_ARN` được cấu hình trên `s3-processor` và `job-consumer`, hệ thống phát sự kiện `FILE_PROCESSED` hoặc `FILE_FAILED` qua **Transactional Outbox** (`src/lib/sns.ts`) tới **SNS Topic `lambda-file-api-file-processed`**, phân phối độc lập tới 2 SQS queues kèm **Filter Policy**:
+
+* **Subscription 1 (`lambda-file-api-audit-queue`):** Filter `{"status": ["processed", "failed"]}` → `lambda-file-api-audit-consumer` (`src/handlers/auditConsumer.ts`) ghi `audit_logs`.
+* **Subscription 2 (`lambda-file-api-summary-queue`):** Filter `{"status": ["processed"]}` → `lambda-file-api-summary-consumer` (`src/handlers/summaryConsumer.ts`) cập nhật `daily_summaries` (`processing_runs`, `total_rows`).
+* **Fenced Lease Outbox & Tách biệt trạng thái:** `outbox` được ghi trong cùng transaction với `file_jobs.status = 'processed'` (`notification_status = 'pending'`) hoặc `'failed'`. Lời gọi `sns.publish()` thực hiện ngoài DB transaction với `lease_token` fencing; nếu SNS lỗi, `file_jobs.status` vẫn giữ `'processed'` và `outbox` giữ `'pending'` để Phase 5 recovery retry mà không chạy lại Excel processing.
+* **Consumer Deduplication (`consumer_processed_events`):** Mỗi consumer chèn `(consumer_name, event_id)` (dùng `outbox.event_id` ổn định thay vì `SNS/SQS MessageId`) trong cùng transaction với `audit_logs` / `daily_summaries`, đảm bảo idempotent trước cả SQS duplicate lẫn Outbox retry.
+
+### 5.2. Kết quả Kiểm thử Cục bộ (`npm run test:phase4`)
+
+| Kịch bản kiểm thử | Kết quả | Chi tiết xác minh |
+| :--- | :---: | :--- |
+| **1. `FILE_PROCESSED` fan-out (`audit` + `summary`)** | **PASS** | `outbox='published'`, `notification_status='published'`, ghi `audit_logs` và `daily_summaries` (`runs=1, rows=30`) |
+| **2. Duplicate `eventId` idempotency** | **PASS** | `consumer_processed_events` bỏ qua bản ghi trùng ở cả 2 consumers (`audit_logs=1`, `runs=1`) |
+| **3. Outbox SNS failure detection** | **PASS** | Khi `sns.publish` lỗi: `outbox='pending'` (`attempts=1`), `file_jobs.status='processed'`, `notification_status='pending'`, không throw |
+| **4. SNS Filter Policy (`FILE_FAILED`)** | **PASS** | Chỉ `audit-queue` nhận `FILE_FAILED`; `summary-queue` không nhận (`daily_summaries` không đổi) |
+| **5. Failure isolation** | **PASS** | `summary-consumer` lỗi DB không ảnh hưởng `audit-consumer` |
+
+### 5.3. Kết quả Triển khai & Kiểm thử Thực tế trên AWS (`ap-southeast-2`, Account `963348789774`)
+
+* **Hạ tầng đã triển khai (`infra/30-sns.sh`, `31-sns-lambdas.sh`):**
+  * **SNS Topic:** `arn:aws:sns:ap-southeast-2:963348789774:lambda-file-api-file-processed`.
+  * **Subscriptions & Filter Policies:**
+    * `lambda-file-api-audit-queue` (kèm `audit-dlq`): `{"status":["processed","failed"]}`.
+    * `lambda-file-api-summary-queue` (kèm `summary-dlq`): `{"status":["processed"]}`.
+  * **SNS Interface VPC Endpoint:** Tạo trong `vpc-00c2860082f941555` (`subnet-0310fa3048f370809`).
+  * **Fan-out Consumers & Publisher Config:** Deploy `lambda-file-api-audit-consumer` và `lambda-file-api-summary-consumer` (128 MB, 30s, VPC, SQS ESM); bật `SNS_TOPIC_ARN` cho `s3-processor` và `job-consumer`.
+* **Kết quả kiểm thử end-to-end trên AWS:**
+  * Upload `medium-1000rows.xlsx` cho `fileId = 01b57c54-2d9e-4706-9875-41924b26cd92` → sau 15s, `GET /file/{id}` trả `status: "processed"`, `notificationStatus: "published"`, `rowCount: 1000`, `processedKey: "processed/01b57c54-2d9e-4706-9875-41924b26cd92/result.xlsx"`, xác nhận Outbox và `sns.publish()` qua SNS VPC Endpoint hoạt động trên AWS.
+  * *Phạm vi chưa kiểm tra trực tiếp trên AWS:* Chưa truy vấn trực tiếp bảng `audit_logs` và `daily_summaries` trên RDS sau fan-out, và chưa chạy bài test `reserved-concurrent-executions=0` cho `summary-consumer`.
+
+---
+
+## 6. Phase 5 — EventBridge Scheduler
+
+> **Trạng thái:** **Deployed to AWS & Tested (2 Schedules `ENABLED`, manual invoke `mode=all` verified against live RDS; Local test suite 4/4 PASS)** · Kịch bản chèn bản ghi giả stuck job (`> 1h`) và pending outbox (`> 5m`) trực tiếp vào RDS thật chưa thực hiện (đã kiểm chứng qua local test suite).
+
+### 6.1. Mục tiêu và Kiến trúc
+Sử dụng **1 Lambda function** (`lambda-file-api-maintenance`, `src/handlers/maintenance.ts`, 256 MB, 300s, VPC) kết hợp **2 EventBridge Scheduler schedules** tách biệt theo tần suất:
+
+1. **`lambda-file-api-daily-maintenance` (`cron(0 1 * * ? *)`, Flexible Window 15 phút, `{"mode":"daily"}`):**
+   - `runCleanupAudit`: Xóa `audit_logs` cũ hơn 30 ngày theo từng batch an toàn (`LIMIT 1000`), sau đó ghi bản ghi `MAINTENANCE_RUN`.
+2. **`lambda-file-api-outbox-recovery` (`rate(5 minutes)`, Flexible Window OFF, `{"mode":"recovery"}`):**
+   - `runDetectStuck`: Trong một `PoolClient` transaction, chuyển các job ở `processing` hoặc `uploading` quá `1 giờ` sang `timeout`, hủy `outbox` `pending` cũ của chúng, và ghi `outbox` `FILE_FAILED` (dùng `dedup_key = file_failed:<fileId>:<started_epoch>`); sau đó gọi `bestEffortFencedPublish` ngoài transaction.
+   - `runOutboxRetry`: Claim tối đa 20 bản ghi `outbox` `pending` (`created_at > 5 phút`, `locked_at IS NULL` hoặc lease `> 10 phút`) bằng `FOR UPDATE SKIP LOCKED` + `lease_token`, `COMMIT` để giải phóng lock trước khi gọi SNS, và gọi `bestEffortFencedPublish` (giữ nguyên `event_id` gốc, ngưỡng `attempts >= 3` → `failed`).
+
+### 6.2. Kết quả Kiểm thử Cục bộ (`npm run test:phase5`)
+
+| Kịch bản kiểm thử | Kết quả | Chi tiết xác minh |
+| :--- | :---: | :--- |
+| **1. Daily audit cleanup (30-day boundary, batching, idempotency)** | **PASS** | 5 bản ghi > 30 ngày bị xóa qua 3 batch (`batchSize=2`); bản ghi 29 ngày giữ nguyên; chạy lại lần 2 xóa 0 dòng |
+| **2. Stalled job detection (`<= 1h` active vs `> 1h` stalled)** | **PASS** | Job 20m/45m giữ nguyên; job 90m/120m chuyển `timeout` + phát `FILE_FAILED`; chạy lại không tạo trùng |
+| **3. Outbox retry (expired lease, preserved `event_id`, `attempts>=3`, fencing)** | **PASS** | Claim bản ghi `> 5m` & lease hết hạn `> 10m`, bỏ qua lease active & bản ghi mới; giữ nguyên `event_id` (`summary-consumer` dedup an toàn); `attempts=3` → `failed`; `lease_token` cũ bị từ chối khi lease bị thu hồi |
+| **4. Manual invoke (`mode` omitted)** | **PASS** | Chạy cả `daily` và `recovery` tuần tự, trả kết quả tổng hợp |
+
+### 6.3. Kết quả Triển khai & Kiểm thử Thực tế trên AWS (`ap-southeast-2`, Account `963348789774`)
+
+* **Hạ tầng đã triển khai (`infra/40-scheduler.sh`):**
+  * **Lambda:** `lambda-file-api-maintenance` (256 MB, 300s, VPC, gắn `DB_SECRET_ARN` và `SNS_TOPIC_ARN`).
+  * **Scheduler IAM Role:** `lambda-file-api-scheduler-role` (`scheduler.amazonaws.com` trust, `lambda:InvokeFunction` trên `lambda-file-api-maintenance`).
+  * **Schedules:**
+    * `lambda-file-api-daily-maintenance`: `cron(0 1 * * ? *)`, timezone `UTC`, `State: ENABLED`.
+    * `lambda-file-api-outbox-recovery`: `rate(5 minutes)`, timezone `UTC`, `State: ENABLED`.
+* **Kết quả chạy `infra/41-scheduler-test.sh` trên AWS:**
+  * Manual invoke `lambda-file-api-maintenance` (`{"source":"manual-test"}`) kết nối thành công tới RDS PostgreSQL trong VPC và trả về:
+    `{"mode":"all","cleanupAudit":{"deletedRows":0,"batches":0},"detectStuck":{"stuckCount":0,"stuckFileIds":[],"failedNotificationsPublished":0},"outboxRetry":{"retriedCount":0,"successCount":0,"failedCount":0}}`.
+  * *Phạm vi chưa kiểm tra trực tiếp trên AWS:* Chưa chèn dữ liệu giả stuck job / outbox pending trực tiếp vào RDS để quan sát `detectStuck` / `outboxRetry` thay đổi bản ghi thật trên AWS.
+
+---
+
+## 7. Phase 6 — Lambda Layer và Cache
+
+> **Trạng thái:** **Deployed to AWS & Tested (`lambda-file-api-common:1` attached to 8 Lambdas; cold/warm container cache verified on AWS; Local test suite 6/6 PASS)** · Thử nghiệm nâng cấp Layer v1 → v2 và TTL 30s expiry trên AWS mới kiểm chứng ở local test suite.
+
+### 7.1. Phase 6A — Lambda Layer (`lambda-file-api-common`)
+* **Mục tiêu & Phạm vi tách Layer:** Chỉ đưa các module dùng chung thực sự (`pg-helper`, `logger`, `response-builder` và thư viện `pg` gồm 13 packages trong dependency tree) vào `layer/nodejs/node_modules/<pkg>/{package.json,index.js,index.d.ts}` (tương thích `nodejs24.x` CommonJS `NODE_PATH=/opt/nodejs/node_modules`). Business logic chuyên biệt (`excelProcessor`, `excelGenerator`, `excelParser`, `multipartParser`) và Phase 1 handlers giữ nguyên trong từng function package.
+* **Cấu hình TypeScript & Packaging:** `tsconfig.json` map `paths` (`pg-helper`, `logger`, `response-builder` → `src/layer/*.ts`) với `declaration: true`; `scripts/build-layer.mjs` đóng gói cấu trúc Layer chuẩn; `scripts/package.sh` loại trừ `pg*`, `pg-helper`, `logger`, `response-builder` khỏi zip của 8 functions Phase 2–5 (`with-layer`), giữ nguyên 5 functions Phase 1.
+* **Versioning:** `infra/50-layer.sh` publish version bất biến (`publish-layer-version`) và gắn ARN vào 8 functions; `logger` đính kèm `layerVersion` (`LAYER_VERSION`) giúp quan sát trực tiếp bản Layer đang chạy.
+
+### 7.2. Phase 6B — Lambda Execution Environment Cache
+* **Use case thực tế (`src/handlers/fileQuery.ts`):** `GET /file/{id}` sử dụng bounded `Map` (`MAX_CACHE_SIZE = 500`, `CACHE_TTL_MS = 30,000 ms`, lazy TTL eviction + LRU) ở module scope kèm `CONTAINER_ID`, `COLD_START_AT`, `invocationCount`, và `source: 'container-cache' | 'database'`. `GET /file/{id}/rows` luôn truy vấn trực tiếp PostgreSQL (không cache row data).
+* **Credential TTL & Rotation (`src/layer/pg-helper.ts`):** Secrets Manager cache có TTL 10 phút và tự động reset `pg.Pool` khi gặp mã lỗi xác thực PostgreSQL `28P01`/`28000`.
+* **Giới hạn & Phân biệt với ElastiCache:** Container cache có độ trễ ~0 ms nhưng **không chia sẻ** giữa các concurrent Lambda containers và mất khi container bị recycle. ElastiCache Redis/Valkey là tùy chọn nâng cao (có phí theo giờ), **không** triển khai tự động.
+
+### 7.3. Kết quả Kiểm thử Cục bộ (`npm run test:phase6`)
+
+| Kịch bản kiểm thử | Kết quả | Chi tiết xác minh |
+| :--- | :---: | :--- |
+| **1. Layer layout & module resolution** | **PASS** | Đủ `pg` + `pg-helper`/`logger`/`response-builder` (`package.json`, `index.js`, `index.d.ts`) |
+| **2. Cold start vs Warm hit & `/rows` bypass** | **PASS** | Request 1 `isColdStart=true, source='database'`; Request 2 `source='container-cache'` (0 DB query); `/rows` luôn `source='database'` |
+| **3. TTL expiration & refresh** | **PASS** | Trong TTL trả dữ liệu cũ (`container-cache`); sau khi hết TTL tự truy vấn lại DB (`database`) |
+| **4. Bounded LRU eviction (`MAX_CACHE_SIZE=2`)** | **PASS** | Evict entry ít dùng gần nhất khi đầy |
+| **5. Concurrent container isolation** | **PASS** | Hai module instances có `containerId` khác nhau và đều cold-miss độc lập |
+| **6. Auth error (`28P01`) pool invalidation** | **PASS** | Tự động đóng và reset pool stale khi gặp lỗi xác thực |
+
+### 7.4. Kết quả Triển khai & Kiểm thử Thực tế trên AWS (`ap-southeast-2`, Account `963348789774`)
+
+* **Phase 6A — Lambda Layer (`infra/50-layer.sh`):**
+  * Đóng gói `lambda-file-api-common-layer.zip` (`164K`) chứa `pg` (13 packages) + `pg-helper`, `logger`, `response-builder`.
+  * Publish thành công `arn:aws:lambda:ap-southeast-2:963348789774:layer:lambda-file-api-common:1` và gắn cho cả **8** Lambda functions Phase 2–5 (`upload-to-s3`, `s3-processor`, `file-query`, `job-producer`, `job-consumer`, `audit-consumer`, `summary-consumer`, `maintenance`).
+* **Phase 6B — Container Cache (`infra/51-cache-test.sh` trên `GET /file/01b57c54-2d9e-4706-9875-41924b26cd92`):**
+  * **Sequential (`req=1..6`):** `req=1` ghi nhận cold start (`containerId=3a6f86c9`, `isColdStart=true`, `source=database`, `status=processed`); `req=2..6` đều hit cache trên cùng execution environment (`containerId=3a6f86c9`, `isColdStart=false`, `source=container-cache`).
+  * **Concurrent (`concurrent=1..6`):** Cả 6 request song song vẫn được định tuyến vào cùng warm container `3a6f86c9` (`source=container-cache`) do thời gian phản hồi từ RAM rất ngắn. Điều này phản ánh thực tế rằng số lượng container đồng thời phụ thuộc vào tốc độ xử lý và độ trùng thời điểm của request, không cố định.
+  * *Phạm vi chưa kiểm tra trực tiếp trên AWS:* Chưa thực hiện nâng cấp live Layer v1 → v2 và bài test chờ 31 giây hết hạn TTL sau khi `UPDATE` DB trên AWS (đã kiểm chứng ở local test suite).
+
+---
+
+## 8. Kiến trúc Tổng thể và Kết quả Kỹ thuật Tổng hợp
+
+> **Trạng thái:** **Completed (Phases 1–6 Implemented, Tested Locally, and Deployed/Verified on AWS `ap-southeast-2`, Account `963348789774`)**.
+
+### 8.1. Tổng hợp Luồng Xử lý Cuối cùng
+Hệ thống `lambda-file-processing-api` tiến hóa từ API đồng bộ đơn giản ở Phase 1 thành pipeline xử lý file hướng sự kiện trên AWS Serverless:
+1. **API đồng bộ & Giới hạn nền tảng (Phase 1):** Xác định trần upload thực tế ~4.50 MiB raw qua API Gateway/Lambda `BUFFERED` do Base64 inflation (+33.3%), tối ưu CPU theo RAM (1,024 MB nhanh hơn 10.04× so với 128 MB), và streaming tải về tới 190 MiB qua Function URL `RESPONSE_STREAM`.
+2. **Upload file lớn & ACID Persistence (Phase 2):** Vượt trần ~4.50 MiB bằng Presigned URL (`POST /upload-to-s3`) → S3 `input/*.xlsx` → `s3-processor` trong VPC → transaction PostgreSQL (`file_jobs`, `file_records`) → `processed/{fileId}/result.xlsx` (ngăn vòng lặp S3).
+3. **Reprocessing & Cô lập lỗi (Phase 3):** `POST /process-job` chuyển nguyên tử `failed/timeout → pending` và đẩy vào SQS (`VisibilityTimeout=900s`, `maxReceiveCount=3` → DLQ), tái sử dụng `processExcelFile` kèm `processing_jobs` (`180s` stale recovery).
+4. **Fan-out & Outbox (Phase 4):** Bật `SNS_TOPIC_ARN` ghi `outbox` (`FILE_PROCESSED` / `FILE_FAILED`) trong cùng transaction với `file_jobs`, publish qua SNS VPC Endpoint tới `audit-queue` (`processed`, `failed`) và `summary-queue` (`processed`), deduplicate độc lập qua `consumer_processed_events`.
+5. **Tự động bảo trì & Phục hồi (Phase 5):** EventBridge Scheduler (`daily-maintenance` `cron(0 1 * * ? *) UTC` và `outbox-recovery` `rate(5 minutes) UTC`) dọn `audit_logs > 30 ngày`, timeout job kẹt `> 1 giờ`, và retry `outbox` bằng `FOR UPDATE SKIP LOCKED` + `lease_token`.
+6. **Code Reuse & Caching (Phase 6):** Tách `pg`, `pg-helper`, `logger`, `response-builder` vào Lambda Layer `lambda-file-api-common:1` (`164K`) và dùng bounded LRU/TTL container cache (30s) trên `GET /file/{id}`.
+
+### 8.2. Kết luận và Giới hạn Ghi nhận
+* **Kết quả đã kiểm chứng:** Toàn bộ 6 phases đã chạy và xác minh end-to-end trên AWS (`ap-southeast-2`) kèm bộ kiểm thử cục bộ (`test:local` 4/4, `test:phase2` 8/8, `test:phase3` 5/5, `test:phase4` 5/5, `test:phase5` 4/4, `test:phase6` 6/6).
+* **Giới hạn & phần chỉ kiểm chứng cục bộ:** Một số kịch bản biên (concurrent duplicate S3 invoke, transient retry 3 lần vào DLQ, `summary-consumer` reserved concurrency `0`, stuck job `> 1h` trên RDS, và Layer v1 → v2 live upgrade) được kiểm chứng bằng local mock test suite thay vì tạo tải/lỗi nhân tạo trực tiếp trên RDS/AWS.
+* **Trade-off chi phí & bảo mật:** Dùng chung `lambda-file-api-execution-role` cho các Lambdas (đơn giản cho môi trường học tập, không phải strict per-function role như production) và đặt RDS trong Private Subnet dùng 3 VPC Interface Endpoints thay cho NAT Gateway hoặc RDS Proxy.

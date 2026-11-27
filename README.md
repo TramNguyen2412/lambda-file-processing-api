@@ -44,11 +44,12 @@ Client / cURL
           │
           ├── Parse Excel & INSERT file_records (PostgreSQL transaction)
           ├── Upload result → S3 processed/ (không trigger lại S3 Event)
-          └── [Phase 4+ 🔲] Outbox → Publish SNS Topic: file-processed
+          └── [Phase 4+ 🔲] Outbox → Publish SNS Topic: file-processed (FILE_PROCESSED | FILE_FAILED)
                                            │
                                  ┌─────────┴──────────┐
                                  ▼                    ▼
                          SQS: audit-queue      SQS: summary-queue
+                         (processed, failed)   (only processed)
                                  │                    │
                          Lambda: audit-consumer  Lambda: summary-consumer (VPC)
                                  │                    │
@@ -65,11 +66,11 @@ Client / cURL
           ▼
     Lambda: maintenance (VPC)
           ├── [daily]    DELETE audit_logs > 30 ngày
-          ├── [recovery] UPDATE stuck file_jobs ('processing'/'uploading' > 1h) → 'timeout'
-          └── [recovery] Retry pending outbox > 5 phút → SNS (max 3 attempts)
+          ├── [recovery] UPDATE stuck file_jobs ('processing'/'uploading' > 1h) → 'timeout' (+ FILE_FAILED outbox)
+          └── [recovery] Fenced lease retry pending outbox > 5 phút → SNS (lease 10 phút, ngưỡng attempts >= 3)
 
     Lambda Layer: common-layer (Phase 6 🔲)
-          └── pg-helper, logger, response-builder (dùng chung cho các Phase 2–5 Lambdas)
+          └── pg, pg-helper, logger, response-builder (dùng chung cho các Phase 2–5 Lambdas)
 ```
 
 ---
@@ -88,7 +89,7 @@ Client / cURL
 | Event Bus | Amazon SNS (Standard Topic) |
 | Scheduler | Amazon EventBridge Scheduler |
 | Shared Code | Lambda Layer |
-| Cache (optional) | Amazon ElastiCache (Redis/Valkey) |
+| Cache (optional) | Amazon ElastiCache (Valkey / Redis OSS) |
 | Observability | Amazon CloudWatch Logs |
 | Networking | VPC, Security Groups, VPC Endpoints |
 
@@ -151,3 +152,4 @@ cat docs/PLAN.md
 ```
 
 📄 **Kế hoạch chi tiết từng phase:** [docs/PLAN.md](docs/PLAN.md)
+📋 **Quy tắc thực thi cho coding agent (local-only):** [AGENT_RULES.md](AGENT_RULES.md)
