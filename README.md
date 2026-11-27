@@ -1,130 +1,153 @@
-# AWS Lambda File Processing API
+# AWS Serverless Learning Project
 
-> **Mini-project tìm hiểu giới hạn kích thước, cơ chế upload và xuất tệp Excel trên AWS Lambda (Node.js 24 & TypeScript)**
-
----
-
-## 1. Giới thiệu
-
-Khi xử lý tệp nhị phân (như bảng tính Excel `.xlsx`) trực tiếp trên AWS Lambda mà không sử dụng dịch vụ lưu trữ trung gian (S3, cơ sở dữ liệu), hệ thống thường gặp các giới hạn kỹ thuật về kích thước tải trọng (payload), hiện tượng tăng dung lượng do mã hóa Base64 và thời gian thực thi (timeout).
-
-Đây là một **mini-project thử nghiệm** nhằm triển khai và đo đạc thực tế các giới hạn nêu trên trong môi trường AWS Serverless.
-
-### Các nội dung chính được thử nghiệm
-1. **Giới hạn kích thước khi upload:** Đối chiếu thực tế giữa API Gateway HTTP API (mức chặn 10 MB) và giới hạn gọi đồng bộ của AWS Lambda (6 MiB = `6,291,456 bytes`).
-2. **Chi phí mã hóa Base64:** Khi gửi tệp nhị phân qua API Gateway v2 hoặc Function URL, nội dung được chuyển sang Base64 (+33.3% dung lượng), làm kích thước tệp thô tối đa có thể upload giảm xuống còn khoảng ~4.50 MiB (`~4.72 MB`).
-3. **Cơ chế trả tệp về (`BUFFERED` và `RESPONSE_STREAM`):** So sánh giữa phản hồi đồng bộ một lần (giới hạn 6 MiB) và truyền từng phần qua Function URL `RESPONSE_STREAM` (tài liệu AWS công bố tối đa 200 MB).
-4. **Truy vết nguồn gốc lỗi `HTTP 413`:** Kết hợp API Gateway Access Logs, cURL và CloudWatch Logs của Lambda để phân biệt yêu cầu bị từ chối trước giai đoạn Stage Integration, tại bước gọi Lambda hay trong logic xử lý của handler.
-
-### Công nghệ sử dụng
-* **Runtime:** Node.js 24 (`nodejs24.x`), viết bằng TypeScript.
-* **Cổng API:** AWS API Gateway HTTP API (Payload Format 2.0) và AWS Lambda Function URLs (`BUFFERED` & `RESPONSE_STREAM`).
-* **Xử lý Excel:** Thư viện `exceljs`.
-* **Log:** Amazon CloudWatch Logs.
+> **Thực nghiệm sâu AWS Serverless** – từ upload file Excel đến S3 Event, SQS, SNS, EventBridge Scheduler, Lambda Layers và caching  
+> **Runtime:** Node.js 24 (`nodejs24.x`) · TypeScript · AWS Lambda · API Gateway HTTP API  
+> **Database:** Amazon RDS for PostgreSQL
 
 ---
 
-## 2. Kiến trúc tổng thể
+## Tổng quan
 
-```mermaid
-flowchart TD
-    subgraph Clients["Client"]
-        C1["Client / cURL"]
-    end
+Project được xây dựng theo từng phase, mỗi phase trả lời một câu hỏi kỹ thuật cụ thể nhằm hiểu rõ **tại sao** mỗi AWS service được chọn:
 
-    subgraph APIGW["Amazon API Gateway HTTP API (Giới hạn 10 MB)"]
-        Edge["Tầng tiếp nhận API GW"]
-        Stage["Stage 'dev' (Access Logs)"]
-        Edge --> Stage
-    end
+| Phase | Trạng thái | Câu hỏi kỹ thuật | Services & Lý do sử dụng |
+|---|:---:|---|---|
+| **1** | ✅ | Giới hạn thực tế của Lambda khi xử lý file nhị phân là gì? | **Lambda, API Gateway, Function URL** – Đo giới hạn payload (~4.5 MiB Base64), memory scaling và response streaming |
+| **2** | 🔲 | File lớn và event-driven processing hoạt động thế nào? | **S3, S3 Event, RDS PostgreSQL** – Presigned URL vượt giới hạn payload; S3 Event kích hoạt xử lý bất đồng bộ; PostgreSQL lưu dữ liệu có cấu trúc với ACID transaction |
+| **3** | 🔲 | Làm thế nào tách bước tiếp nhận request khỏi xử lý thực tế? | **SQS, DLQ** – Hàng đợi cho reprocessing (`failed`/`timeout`), kiểm soát retry theo Visibility Timeout và cô lập lỗi vào DLQ |
+| **4** | 🔲 | Khi nhiều hệ thống cần biết cùng một event, dùng gì? | **SNS → SQS Fan-out** – Phát event một lần qua Outbox tới nhiều consumer độc lập (`audit`, `summary`) kèm message filtering và idempotency |
+| **5** | 🔲 | Maintenance task định kỳ không cần người kích hoạt? | **EventBridge Scheduler** – Tự động dọn `audit_logs` cũ (daily), phát hiện stuck jobs và retry pending outbox (5-min recovery) |
+| **6** | 🔲 | Ba loại caching trong Lambda khác nhau thế nào? | **Lambda Layer, Container Cache, ElastiCache (optional)** – So sánh code reuse (Layer), in-memory per-instance (Container) và shared network cache (Redis) |
 
-    subgraph FURL["Lambda Function URLs"]
-        FURL_Buff["Upload / Generate URL (BUFFERED - 6 MiB)"]
-        FURL_Stream["Streaming URL (RESPONSE_STREAM - 200 MB)"]
-    end
+---
 
-    subgraph Compute["AWS Lambda (Node.js 24)"]
-        fn_health["lambda-file-api-health (128 MB / 10s)"]
-        fn_info["lambda-file-api-info (128 MB / 10s)"]
-        fn_upload["lambda-file-api-upload-excel (512 MB / 60s)"]
-        fn_gen["lambda-file-api-generate-excel (1024 MB / 120s)"]
-        fn_stream["lambda-file-api-generate-excel-stream (1024 MB / 120s*)"]
-    end
+## Kiến trúc tổng thể (Phase 1 ✅ · Phase 2–6 planned)
 
-    subgraph Telemetry["CloudWatch Logs"]
-        CW_APIGW["API Gateway Access Logs (/aws/apigateway/...)"]
-        CW_Lambda["Lambda Logs (/aws/lambda/...)"]
-    end
+```
+Client / cURL
+     │
+     ├─── API Gateway HTTP API ────────────────────────────────────────────────┐
+     │         │                                                                │
+     │         ├── [Phase 1 ✅] GET /health, GET /info                         │
+     │         ├── [Phase 1 ✅] POST /upload-excel → Lambda (in-memory)         │
+     │         ├── [Phase 1 ✅] GET /generate-excel (+ Function URL stream)     │
+     │         │                                                               │
+     │         ├── [Phase 2 🔲] POST /upload-to-s3 → Lambda (VPC: RDS + S3 URL)│
+     │         │                Client PUT trực tiếp lên S3 input/             │
+     │         ├── [Phase 2 🔲] GET /file/:id, GET /file/:id/rows → Lambda(VPC)│
+     │         └── [Phase 3 🔲] POST /process-job → Lambda (VPC: RDS) → SQS    │
+     │                                                                         │
+     S3 Event (chỉ prefix input/, suffix .xlsx)                                │
+          │                                                                    │
+          ▼                                                                    │
+    Lambda: s3-processor (VPC) ────────────────────────────────────────────────┘
+          │
+          ├── Parse Excel & INSERT file_records (PostgreSQL transaction)
+          ├── Upload result → S3 processed/ (không trigger lại S3 Event)
+          └── [Phase 4+ 🔲] Outbox → Publish SNS Topic: file-processed
+                                           │
+                                 ┌─────────┴──────────┐
+                                 ▼                    ▼
+                         SQS: audit-queue      SQS: summary-queue
+                                 │                    │
+                         Lambda: audit-consumer  Lambda: summary-consumer (VPC)
+                                 │                    │
+                         INSERT audit_logs        UPSERT daily_summaries
+                              (dedup qua consumer_processed_events)
 
-    C1 -- "POST /upload-excel" --> Edge
-    Stage -- "AWS_PROXY (Base64 Event <= 6 MiB)" --> fn_upload
-    Stage -. "Log Event" .-> CW_APIGW
+    SQS jobs-queue (Phase 3 🔲)
+          │
+          ▼
+    Lambda: job-consumer (VPC, shared Excel logic + processing_jobs retry state)
 
-    C1 -- "POST (Upload trực tiếp)" --> FURL_Buff
-    FURL_Buff -- "RequestResponse <= 6 MiB" --> fn_upload
+    EventBridge Scheduler (Phase 5 🔲: daily 1:00 AM UTC + 5-min recovery)
+          │
+          ▼
+    Lambda: maintenance (VPC)
+          ├── [daily]    DELETE audit_logs > 30 ngày
+          ├── [recovery] UPDATE stuck file_jobs ('processing'/'uploading' > 1h) → 'timeout'
+          └── [recovery] Retry pending outbox > 5 phút → SNS (max 3 attempts)
 
-    C1 -- "GET /health" --> Edge --> Stage --> fn_health
-    C1 -- "GET /info" --> Edge --> Stage --> fn_info
-    C1 -- "GET /generate-excel" --> Edge --> Stage --> fn_gen
-
-    C1 -- "GET (Buffered)" --> FURL_Buff --> fn_gen
-    C1 -- "GET (Streaming)" --> FURL_Stream --> fn_stream
-
-    fn_upload -. "Logs" .-> CW_Lambda
-    fn_gen -. "Logs" .-> CW_Lambda
-    fn_stream -. "Logs" .-> CW_Lambda
+    Lambda Layer: common-layer (Phase 6 🔲)
+          └── pg-helper, logger, response-builder (dùng chung cho các Phase 2–5 Lambdas)
 ```
 
-### Các hàm Lambda trong bài thực hành
-* **`health` & `info`:** Kiểm tra trạng thái chạy của Lambda và trả về danh sách các giới hạn AWS để tra cứu nhanh.
-* **`upload-excel`:** Giải mã Base64, tách file từ `multipart/form-data` (nếu có), chặn file > 5 MiB (`MAX_PARSE_BYTES`), kiểm tra 4 byte đầu `PK\x03\x04` của file `.xlsx`, rồi đọc số dòng/cột và 5 dòng mẫu.
-* **`generate-excel`:** Tạo tệp `.xlsx` trong bộ nhớ, chuyển sang Base64 và trả về đồng bộ trong một phản hồi duy nhất.
-* **`generate-excel-stream`:** Tạo file `.xlsx` hoặc bơm dữ liệu giả lập (`?mode=synthetic`) theo từng chunk `64 KiB` qua `awslambda.streamifyResponse`.
+---
+
+## Technology Stack
+
+| Category | Technology |
+|---|---|
+| Runtime | Node.js 24 (`nodejs24.x`), TypeScript |
+| Compute | AWS Lambda |
+| API Gateway | Amazon API Gateway HTTP API (v2) |
+| File Storage | Amazon S3 |
+| Database | Amazon RDS for PostgreSQL (db.t3.micro) |
+| Credentials | AWS Secrets Manager |
+| Async Queue | Amazon SQS (Standard Queue) |
+| Event Bus | Amazon SNS (Standard Topic) |
+| Scheduler | Amazon EventBridge Scheduler |
+| Shared Code | Lambda Layer |
+| Cache (optional) | Amazon ElastiCache (Redis/Valkey) |
+| Observability | Amazon CloudWatch Logs |
+| Networking | VPC, Security Groups, VPC Endpoints |
 
 ---
 
-## 3. Cấu trúc thư mục
+## Phase 1 – Completed ✅
+
+Tìm hiểu giới hạn thực tế của AWS Lambda khi xử lý file nhị phân **mà không dùng S3 hay Database**.
+
+**Kết quả thực nghiệm chính:**
+- Base64 Inflation: file thô tối đa ~4.50 MiB qua API Gateway (giải thích tại sao cần S3 ở Phase 2)
+- Memory scaling: 128 MB → 1024 MB, nhanh hơn 10.04×
+- Response Streaming: thành công tới 190 MiB via Function URL RESPONSE_STREAM
+- 21/21 test cases PASS
+
+📄 Chi tiết: [docs/EXPERIMENT_REPORT.md](docs/EXPERIMENT_REPORT.md)
+
+---
+
+## Cấu trúc thư mục
 
 ```
 lambda-file-processing-api/
-├── README.md                      ← Giới thiệu và cấu trúc mini-project
-├── package.json                   ← Dependencies (exceljs) và npm scripts
-├── tsconfig.json                  ← Cấu hình biên dịch TypeScript
-├── src/                           ← Mã nguồn TypeScript
-│   ├── handlers/                  ← 5 Lambda handlers
-│   │   ├── health.ts
-│   │   ├── info.ts
-│   │   ├── uploadExcel.ts
-│   │   ├── generateExcel.ts
-│   │   └── generateExcelStream.ts
-│   └── utils/                     ← Tiện ích sinh/đọc Excel & tách multipart
-│       ├── excelGenerator.ts
-│       ├── excelParser.ts
-│       └── multipartParser.ts
-├── infra/                         ← Các script Bash + AWS CLI để dựng và test
-│   ├── 00-variables.sh            ← Biến dùng chung (Region, Account, tên hàm)
-│   ├── 01-iam.sh                  ← Tạo Execution Role (chỉ ghi CloudWatch Logs)
-│   ├── 02-lambda.sh               ← Deploy 5 hàm Lambda
-│   ├── 03-apigateway.sh           ← Tạo HTTP API, routes, Stage 'dev' & Access Logs
-│   ├── 04-function-url.sh         ← Tạo Function URLs (BUFFERED & RESPONSE_STREAM)
-│   ├── 05-test.sh                 ← Chạy 21 test kiểm tra chức năng và ranh giới
-│   └── 06-benchmark.sh            ← Đo thời gian upload, memory scaling, timeout & streaming
-├── scripts/                       ← Script build zip và tạo file test
-│   ├── package.sh                 ← Build TypeScript và đóng gói .zip vào zips/
-│   ├── generate-test-files.mjs    ← Tạo file Excel mẫu theo dung lượng
-│   └── test-local.mjs             ← Chạy test logic ở local không cần AWS
-├── test-files/                    ← File Excel mẫu để test
-│   ├── generated/
-│   └── datasets/
-└── docs/
-    └── EXPERIMENT_REPORT.md       ← Ghi chép kết quả thực nghiệm (Giai đoạn 01–06)
+├── docs/
+│   ├── PLAN.md                  ← Kế hoạch triển khai Phase 2–6 (đọc trước)
+│   ├── EXPERIMENT_REPORT.md     ← Báo cáo thực nghiệm Phase 1
+│   └── PHASE{N}_*.md            ← Báo cáo từng phase (tạo sau khi hoàn thành)
+│
+├── src/
+│   ├── handlers/                ← Lambda handlers (5 handlers Phase 1 ✅ + Phase 2–5 planned)
+│   ├── lib/                     ← Shared processing logic (Phase 2 planned)
+│   ├── utils/                   ← Utilities Phase 1 ✅ (excelGenerator, excelParser, multipartParser)
+│   └── layer/                   ← Lambda Layer source (Phase 6 planned)
+│
+├── sql/                         ← PostgreSQL schema (Phase 2 planned)
+│   └── schema.sql
+│
+├── infra/
+│   ├── 00–06, 99-*.sh           ← Phase 1 scripts ✅ (không sửa)
+│   ├── 10–19-*.sh               ← Phase 2 (planned): S3 + RDS + PostgreSQL
+│   ├── 20–29-*.sh               ← Phase 3 (planned): SQS + DLQ
+│   ├── 30–39-*.sh               ← Phase 4 (planned): SNS Fan-out
+│   ├── 40–49-*.sh               ← Phase 5 (planned): EventBridge Scheduler
+│   └── 50–59-*.sh               ← Phase 6 (planned): Layer + Cache
+│
+├── scripts/                     ← Build helpers (Phase 1)
+└── test-files/                  ← Test Excel files (Phase 1)
 ```
 
 ---
 
-## 4. Kết quả ghi nhận
+## Bắt đầu
 
-Mini-project đã chạy qua đủ 6 bước từ dựng hạ tầng (`01`–`04`), kiểm thử chức năng & ranh giới (`05-test.sh`: 21/21 PASS) đến đo hiệu năng (`06-benchmark.sh`: so sánh kênh upload, memory scaling 128–1,024 MB, timeout 5s và streaming tới mốc 205 MiB).
+```bash
+# Phase 1 – Đã hoàn thành, xem kết quả
+cat docs/EXPERIMENT_REPORT.md
 
-Chi tiết số liệu đo được, log đối chiếu và các ghi chú kỹ thuật được tổng hợp trong:
-* 📄 **[docs/EXPERIMENT_REPORT.md](docs/EXPERIMENT_REPORT.md)**
+# Phase 2+ – Xem kế hoạch chi tiết
+cat docs/PLAN.md
+```
+
+📄 **Kế hoạch chi tiết từng phase:** [docs/PLAN.md](docs/PLAN.md)
